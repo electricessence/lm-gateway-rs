@@ -190,9 +190,9 @@ fn parse_classification_label(response: &Value) -> ClassLabel {
         .trim_matches(|c: char| !c.is_alphanumeric());
 
     match first {
-        "simple" | "1" | "easy" | "basic" | "trivial" | "low" => ClassLabel::Simple,
-        "moderate" | "2" | "medium" | "normal" | "mid" => ClassLabel::Moderate,
-        "complex" | "3" | "hard" | "difficult" | "expert" | "high" => ClassLabel::Complex,
+        "simple" | "1" | "easy" | "basic" | "trivial" | "low" | "instant" => ClassLabel::Simple,
+        "moderate" | "2" | "medium" | "normal" | "mid" | "fast" => ClassLabel::Moderate,
+        "complex" | "3" | "hard" | "difficult" | "expert" | "high" | "deep" => ClassLabel::Complex,
         other => {
             debug!(label = other, "unrecognised classification label — defaulting to moderate");
             ClassLabel::Moderate
@@ -237,6 +237,11 @@ pub async fn route(
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
 
     tracing::Span::current().record("tier", target_tier.name.as_str());
+
+    // Inject the profile system prompt before dispatching to any backend.
+    if let Some(prompt) = profile.system_prompt.as_deref() {
+        inject_system_prompt(&mut request_body, prompt);
+    }
 
     let (response, entry) = match profile.mode {
         RoutingMode::Dispatch => {
@@ -336,6 +341,39 @@ fn resolve_target_tier<'a>(
 /// 200 ms), doubling per attempt, capped at 2 000 ms. On exhaustion the last
 /// error is returned — in escalate mode this bubbles up to trigger escalation
 /// to the next tier.
+/// Prepend the profile system prompt into the request's messages array.
+///
+/// If the first message already has `role = "system"`, the profile prompt is
+/// placed before its content (separated by `\n\n`), so client-provided context
+/// is preserved while the profile's instructions take precedence.
+/// If there is no existing system message, one is inserted at index 0.
+fn inject_system_prompt(body: &mut Value, prompt: &str) {
+    let Some(messages) = body.pointer_mut("/messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    if let Some(first) = messages.first_mut() {
+        if first.get("role").and_then(Value::as_str) == Some("system") {
+            let existing = first
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let merged = if existing.is_empty() {
+                prompt.to_owned()
+            } else {
+                format!("{prompt}\n\n{existing}")
+            };
+            if let Some(obj) = first.as_object_mut() {
+                obj.insert("content".into(), Value::String(merged));
+            }
+            return;
+        }
+    }
+
+    messages.insert(0, serde_json::json!({ "role": "system", "content": prompt }));
+}
+
 async fn dispatch(
     state: &RouterState,
     body: &mut Value,
@@ -623,6 +661,11 @@ pub async fn route_stream(
     let (resolved_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
 
+    // Inject the profile system prompt before dispatching to any backend.
+    if let Some(prompt) = profile.system_prompt.as_deref() {
+        inject_system_prompt(&mut request_body, prompt);
+    }
+
     // In classify mode, run a non-streaming classification call first to pick
     // the best tier, then stream from that tier instead of the resolved one.
     let target_tier_name: String = if profile.mode == RoutingMode::Classify {
@@ -871,6 +914,7 @@ mod tests {
                 retry_delay_ms: None,
                 health_window: None,
                 health_error_threshold: None,
+                public_profile: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -913,6 +957,8 @@ mod tests {
                         max_auto_tier: "cloud:economy".into(),
                         expert_requires_flag: false,
                         rate_limit_rpm: None,
+                        classifier_prompt: None,
+                        system_prompt: None,
                     },
                 );
                 m
@@ -1027,6 +1073,7 @@ mod tests {
                     retry_delay_ms: None,
                     health_window: None,
                     health_error_threshold: None,
+                    public_profile: None,
                 },
                 backends: std::collections::HashMap::new(),
                 tiers: vec![],

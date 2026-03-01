@@ -1,0 +1,70 @@
+# lm-gateway configuration — language.cortex.lan
+# 3-tier local classify mode — routes to qwen3:1.7b / 8b / 14b via Ollama
+
+[gateway]
+client_port          = 8080
+admin_port           = 8081
+traffic_log_capacity = 500
+log_level            = "info"
+admin_token_env      = "LMG_ADMIN_TOKEN"
+# Unauthenticated LAN requests fall through to this profile instead of 401.
+public_profile       = "default"
+
+# ---------------------------------------------------------------------------
+# Backend — local Ollama on the same container
+# ---------------------------------------------------------------------------
+[backends.ollama]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+
+# ---------------------------------------------------------------------------
+# Tiers — cheapest → most capable (never exposed directly to Ollama clients)
+# ---------------------------------------------------------------------------
+[[tiers]]
+name    = "local:instant"
+backend = "ollama"
+model   = "qwen3:1.7b"
+
+[[tiers]]
+name    = "local:balanced"
+backend = "ollama"
+model   = "qwen3:8b"
+
+[[tiers]]
+name    = "local:expert"
+backend = "ollama"
+model   = "qwen3:14b"
+
+# ---------------------------------------------------------------------------
+# Profiles — these are the "models" Ollama clients see in /api/tags
+# ---------------------------------------------------------------------------
+
+# "ha-auto:latest" — what Home Assistant sees and uses.
+# Classify mode: qwen3:1.7b labels the question, then routes to the right tier.
+# System prompt ensures every model response is HA-aware.
+[profiles.ha-auto]
+mode          = "classify"
+classifier    = "local:instant"
+max_auto_tier = "local:expert"
+system_prompt = """You are an AI assistant integrated with Home Assistant (HA), an open-source home automation platform.
+Help the user with smart home queries, configuration, automations, and troubleshooting.
+
+Guidelines:
+- Be concise. Short direct answers for simple questions; full configs for automation requests.
+- Write automations and scripts in valid Home Assistant YAML using the modern trigger/condition/action syntax.
+- Reference entities by their full entity_id (e.g. light.living_room, switch.kitchen, sensor.outdoor_temperature).
+- For blueprints or complex automations, provide complete, copy-paste-ready YAML.
+- If the user asks about an entity state or service call, use HA naming conventions.
+"""
+
+# "auto:latest" — generic smart router, no HA context. Used by Open WebUI etc.
+[profiles.auto]
+mode          = "classify"
+classifier    = "local:instant"
+max_auto_tier = "local:expert"
+
+# "default" profile — fallback for unauthenticated /v1/chat/completions requests.
+[profiles.default]
+mode          = "classify"
+classifier    = "local:instant"
+max_auto_tier = "local:expert"

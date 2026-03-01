@@ -113,6 +113,7 @@ mod tests {
                     retry_delay_ms: None,
                     health_window: None,
                     health_error_threshold: None,
+                    public_profile: None,
                 },
                 backends: HashMap::new(),
                 tiers: vec![],

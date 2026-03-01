@@ -410,6 +410,7 @@ mod tests {
                 retry_delay_ms: None,
                 health_window: None,
                 health_error_threshold: None,
+                public_profile: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -452,6 +453,8 @@ mod tests {
                         max_auto_tier: "cloud:economy".into(),
                         expert_requires_flag: false,
                         rate_limit_rpm: None,
+                        classifier_prompt: None,
+                        system_prompt: None,
                     },
                 );
                 m

@@ -442,17 +442,57 @@ pub struct ProfileConfig {
     /// Defaults to [`DEFAULT_CLASSIFIER_PROMPT`] if not set.
     #[serde(default)]
     pub classifier_prompt: Option<String>,
+
+    /// Optional system prompt prepended to every request forwarded through this profile.
+    ///
+    /// When set, this text is injected as a `role = "system"` message at the front of
+    /// the `messages` array before dispatching to the backend. If the request already
+    /// includes a system message, the profile prompt is prepended to it (separated by
+    /// `\n\n`), preserving any client-provided context while ensuring the profile's
+    /// instructions always take precedence.
+    ///
+    /// Useful for per-profile personas, domain constraints, or output-format rules.
+    ///
+    /// ```toml
+    /// [profiles.ha-auto]
+    /// system_prompt = "You are a smart home assistant integrated with Home Assistant. ..."
+    /// ```
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 /// Default classification prompt injected as the system message for `classify` mode.
+///
+/// Returns one of `instant`, `fast`, or `deep` — the router maps these to the
+/// first, middle, and last tier in the profile's auto range respectively.
+/// These labels are also accepted as synonyms for the legacy `simple`/`moderate`/`complex`
+/// vocabulary, so existing configs continue to work unchanged.
+///
+/// This is the v11 prompt (17/18 accuracy on a standard 18-case benchmark against
+/// qwen3:1.7b).  Override per-profile with `classifier_prompt` if your workload
+/// or model needs a different rubric.
 pub const DEFAULT_CLASSIFIER_PROMPT: &str = "\
-You are a routing classifier. Given the user message below, respond with ONLY ONE WORD \
-that describes its complexity:\n\
-  simple   — greetings, yes/no, basic facts, trivial single-step tasks\n\
-  moderate — explanations, summaries, simple code, multi-turn conversation\n\
-  complex  — deep reasoning, debugging, architecture, complex code, multi-step analysis\n\
+You are a request router. Reply with one word: instant, fast, or deep.\n\
 \n\
-Respond with exactly one word: simple, moderate, or complex. No punctuation, no explanation.";
+- instant: single value or one-sentence fact (greetings, arithmetic, yes/no, \
+simple lookups: capitals, temperatures, currency conversions)\n\
+- fast: needs a paragraph or code snippet (define/explain a concept or technology, \
+write a function or regex, fix a common well-known bug, summarize a topic)\n\
+- deep: requires extended effort (architect or design a system, implement a data \
+structure or algorithm from scratch, debug a language-specific or obscure error \
+such as Rust lifetimes, analyze tradeoffs, multi-step research)\n\
+\n\
+Decision rules:\n\
+- Single-fact lookup -> instant regardless of domain\n\
+- Writing any piece of code -> at least fast\n\
+- Explaining what X is/does -> fast\n\
+- Implementing a data structure or algorithm -> deep\n\
+- Debugging a language-specific feature (e.g. Rust lifetimes, ownership, borrowing) -> deep\n\
+- Architecture tasks (architect/design/build a system) -> deep\n\
+- Tradeoff analysis -> deep\n\
+- When uncertain between two tiers, choose the lower one (fast beats deep, instant beats fast).\n\
+\n\
+Reply with one word only.";
 
 /// How the routing decision is made.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -575,6 +615,8 @@ mod tests {
                 max_auto_tier: "local:fast".into(),
                 expert_requires_flag: false,
                 rate_limit_rpm: None,
+                classifier_prompt: None,
+                system_prompt: None,
             },
         );
         assert!(config.validate().is_err());

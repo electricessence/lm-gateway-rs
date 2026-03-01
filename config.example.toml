@@ -112,8 +112,9 @@ expert_requires_flag = true
 # rate_limit_rpm = 60                # tighter quota for escalating (more expensive) callers
 
 # Classify profile — uses a fast model to label complexity before dispatching.
-# A single non-streaming call to `classifier` emits "simple", "moderate", or
-# "complex"; that label maps to tiers[0], tiers[n/2], or tiers[n-1] respectively.
+# A single non-streaming call to `classifier` emits "instant", "fast", or
+# "deep"; that label maps to tiers[0], tiers[n/2], or tiers[n-1] respectively.
+# (Legacy labels "simple"/"moderate"/"complex" are also accepted for backwards compat.)
 # Ideal for local-only deployments where every byte saved matters.
 #
 # Ollama-compatibility endpoints expose PROFILE NAMES as models, not raw tiers:
@@ -125,7 +126,28 @@ expert_requires_flag = true
 mode               = "classify"
 classifier         = "local:fast"   # tier used for the pre-flight classification call
 max_auto_tier      = "cloud:expert" # ceiling tier (tiers[n-1]); remove to cap at mid
-# classifier_prompt = "..."         # override the built-in classification prompt
+# classifier_prompt = "..."         # override the built-in classification prompt (v11, 94% accuracy)
+# system_prompt     = "..."         # prepended to every request forwarded through this profile
+
+# Home Assistant smart-routing profile.
+# Exposes as model "ha-auto" in /api/tags — point HA's Ollama integration here.
+# Injects an HA-aware system prompt into every request so models understand the context,
+# then classifies complexity to route to the cheapest capable tier automatically.
+[profiles.ha-auto]
+mode           = "classify"
+classifier     = "local:fast"
+max_auto_tier  = "cloud:expert"
+system_prompt  = """
+You are an AI assistant integrated with Home Assistant (HA), an open-source home automation platform.
+Help the user with smart home queries, configuration, automations, and troubleshooting.
+
+Guidelines:
+- Be concise. Short direct answers for simple questions; full configs for automation requests.
+- Write automations and scripts in valid Home Assistant YAML using the modern trigger/condition/action syntax.
+- Reference entities by their full entity_id (e.g. light.living_room, switch.kitchen, sensor.outdoor_temperature).
+- For blueprints or complex automations, provide complete, copy-paste-ready YAML.
+- If the user asks about an entity state or service call, use HA naming conventions.
+"""
 
 # ---------------------------------------------------------------------------
 # Local-only smart router example (3-tier — no cloud required)
