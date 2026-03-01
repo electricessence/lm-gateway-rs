@@ -133,56 +133,48 @@ pub async fn list_models(State(state): State<Arc<RouterState>>) -> impl IntoResp
 
 /// `GET /api/tags` — Ollama-compatible model discovery.
 ///
-/// Returns all configured tiers and aliases in the Ollama model list format.
-/// This makes lm-gateway appear as an Ollama server to clients that use the
-/// native Ollama API for model enumeration (e.g. Home Assistant's Ollama
-/// integration, Open WebUI, etc.).
+/// Exposes configured *profiles* as the visible "models", not the underlying
+/// tiers or aliases. This preserves the abstraction: clients (Home Assistant,
+/// Open WebUI, etc.) see logical routing profiles — `auto`, `local`, etc. —
+/// and remain unaware of the tier ladder beneath.
 ///
-/// The `modified_at` and `digest` fields are synthetic — no real model files
-/// are stored by lm-gateway. Clients use `name` for subsequent `/api/chat`
-/// or `/v1/chat/completions` requests.
+/// Selecting a profile name as the model in `POST /api/chat` causes the
+/// gateway to apply that profile's routing mode (classify, dispatch, escalate)
+/// transparently.
 pub async fn list_models_ollama(State(state): State<Arc<RouterState>>) -> impl IntoResponse {
     let config = state.config();
-
     let now = chrono::Utc::now().to_rfc3339();
 
-    let tier_models = config.tiers.iter().map(|t| {
-        json!({
-            "name":        format!("{}:latest", t.name),
-            "model":       format!("{}:latest", t.name),
-            "modified_at": now,
-            "size":        0,
-            "digest":      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "details": {
-                "parent_model":       "",
-                "format":             "gguf",
-                "family":             "lm-gateway",
-                "families":           ["lm-gateway"],
-                "parameter_size":     &t.model,
-                "quantization_level": "auto"
-            }
-        })
-    });
+    let mut profile_names: Vec<&String> = config.profiles.keys().collect();
+    // Stable order: default first, then alphabetical.
+    profile_names.sort_by_key(|n| (n.as_str() != "default", n.as_str()));
 
-    let alias_models = config.aliases.keys().map(|alias| {
-        json!({
-            "name":        format!("{alias}:latest"),
-            "model":       format!("{alias}:latest"),
-            "modified_at": now,
-            "size":        0,
-            "digest":      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "details": {
-                "parent_model":       "",
-                "format":             "gguf",
-                "family":             "lm-gateway",
-                "families":           ["lm-gateway"],
-                "parameter_size":     "auto",
-                "quantization_level": "auto"
-            }
+    let models: Vec<Value> = profile_names
+        .into_iter()
+        .map(|name| {
+            let mode = config
+                .profiles
+                .get(name)
+                .map(|p| p.mode.to_string())
+                .unwrap_or_default();
+            json!({
+                "name":        format!("{name}:latest"),
+                "model":       format!("{name}:latest"),
+                "modified_at": now,
+                "size":        0,
+                "digest":      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "details": {
+                    "parent_model":       "",
+                    "format":             "gguf",
+                    "family":             "lm-gateway",
+                    "families":           ["lm-gateway"],
+                    "parameter_size":     mode,
+                    "quantization_level": "auto"
+                }
+            })
         })
-    });
+        .collect();
 
-    let models: Vec<Value> = tier_models.chain(alias_models).collect();
     Json(json!({ "models": models }))
 }
 
@@ -199,8 +191,11 @@ pub async fn list_models_ollama(State(state): State<Arc<RouterState>>) -> impl I
 /// Ollama's streaming format, translated from the OpenAI SSE stream produced
 /// by the backend.
 ///
-/// The `model` field may be any configured tier name, alias, or `auto-local`
-/// (or whichever alias is defined for the classify profile).
+/// The `model` field may be a profile name (e.g. `auto`, `default`) or any
+/// configured tier name or alias. When a profile name is given, the gateway
+/// applies that profile's routing mode (classify/dispatch/escalate) and the
+/// actual tier selection is handled internally — the caller never needs to
+/// know which underlying model answered.
 pub async fn chat_completions_ollama(
     State(state): State<Arc<RouterState>>,
     request_id_ext: Option<Extension<RequestId>>,
@@ -224,11 +219,29 @@ pub async fn chat_completions_ollama(
         openai_body["model"] = json!(normalised);
     }
 
+    // Profile-as-model: if the (normalised) model name matches a configured profile,
+    // route via that profile and point the model at the profile's classifier tier.
+    // This is the primary path for Ollama clients — they pick a profile name from
+    // /api/tags and the gateway handles all tier selection transparently.
+    let mut profile_override: Option<String> = None;
+    {
+        let config = state.config();
+        if let Some(model_str) = openai_body.get("model").and_then(Value::as_str) {
+            if let Some(prof) = config.profiles.get(model_str) {
+                profile_override = Some(model_str.to_owned());
+                // Route the underlying call via the profile's base (classifier) tier.
+                openai_body["model"] = json!(&prof.classifier);
+            }
+        }
+    }
+
+    let effective_profile = profile_override.as_deref().or(profile.as_deref());
+
     if streaming {
         let (stream, _entry) = crate::router::route_stream(
             &state,
             openai_body,
-            profile.as_deref(),
+            effective_profile,
             req_id.as_deref(),
             expert_gate,
         )
@@ -253,7 +266,7 @@ pub async fn chat_completions_ollama(
     let (response, _entry) = crate::router::route(
         &state,
         openai_body,
-        profile.as_deref(),
+        effective_profile,
         req_id.as_deref(),
         false,
         expert_gate,

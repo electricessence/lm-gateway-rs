@@ -77,8 +77,8 @@ Open the admin UI: `http://localhost:8081/`
 | ------ | ---- | ----------- |
 | `POST` | `/v1/chat/completions` | Route a chat request (OpenAI-compatible) |
 | `GET` | `/v1/models` | List available tiers and aliases |
-| `GET` | `/api/tags` | List models — Ollama-compatible format |
-| `POST` | `/api/chat` | Chat inference — Ollama-compatible format |
+| `GET` | `/api/tags` | List profiles as Ollama "models" |
+| `POST` | `/api/chat` | Chat inference — Ollama-compatible; model field = profile name |
 | `GET` | `/healthz` | Liveness probe |
 
 Use any tier name or alias as the `model` field:
@@ -184,15 +184,17 @@ Two Ollama-format endpoints are always available on the client port:
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `GET /api/tags` | Returns all tiers and aliases in Ollama `GET /api/tags` format |
-| `POST /api/chat` | Accepts an Ollama chat request; routes through the normal pipeline; returns an Ollama response (or NDJSON stream) |
+| `GET /api/tags` | Returns configured *profiles* as Ollama "models" |
+| `POST /api/chat` | Accepts an Ollama chat request; model name = profile name |
 
-This means you can point **Home Assistant**, **Open WebUI**, or any other Ollama client directly at this gateway. The client sees a list of "models" (your tier names and aliases) and can send requests without knowing anything about the underlying routing.
+Profiles are the public surface. Tiers, aliases, and the classify tier ladder are entirely hidden from Ollama clients. When HA asks "what models do you have?", it sees your profile names — `auto`, `default`, or whatever you call them. It never sees the underlying model names.
 
 ```text
-Home Assistant → GET  lm-gateway-host:8080/api/tags  → sees "qwen-auto", "local:instant", …
-               → POST lm-gateway-host:8080/api/chat  → classify mode routes transparently
+Home Assistant → GET  lm-gateway-host:8080/api/tags  → {"models": [{"name":"auto:latest"}, ...]}
+               → POST lm-gateway-host:8080/api/chat  → model="auto" → classify → right tier
 ```
+
+The gateway acts as a drop-in Ollama server. Clients need no awareness of your tier configuration.
 
 ---
 

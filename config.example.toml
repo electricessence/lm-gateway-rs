@@ -116,22 +116,25 @@ expert_requires_flag = true
 # "complex"; that label maps to tiers[0], tiers[n/2], or tiers[n-1] respectively.
 # Ideal for local-only deployments where every byte saved matters.
 #
-# Ollama-compatibility endpoints are active when this gateway is running:
-#   GET  /api/tags      — Ollama-format model discovery (all tiers + aliases)
-#   POST /api/chat      — Ollama-format chat (translates to/from OpenAI internally)
-# Point Home Assistant, Open WebUI, or any Ollama client at this gateway and it
-# will see your virtual "auto-local" model in the model list.
-[profiles.classify]
+# Ollama-compatibility endpoints expose PROFILE NAMES as models, not raw tiers:
+#   GET  /api/tags      — returns {"models": [{"name":"auto:latest"}, ...]}
+#   POST /api/chat      — model="auto" routes through this profile transparently
+# Point Home Assistant or Open WebUI at this gateway and it sees your profiles
+# as selectable "models" — the tier ladder is fully hidden.
+[profiles.auto]
 mode               = "classify"
 classifier         = "local:fast"   # tier used for the pre-flight classification call
 max_auto_tier      = "cloud:expert" # ceiling tier (tiers[n-1]); remove to cap at mid
 # classifier_prompt = "..."         # override the built-in classification prompt
 
 # ---------------------------------------------------------------------------
-# Local-only classify example (3-tier Qwen3 — no cloud required)
+# Local-only smart router example (3-tier — no cloud required)
 # ---------------------------------------------------------------------------
-# Uncomment and place this in a standalone config.toml to run a fully local
-# smart router that Home Assistant (or any Ollama client) can point at.
+# Minimal config to run a fully local classify router that any Ollama client
+# (Home Assistant, Open WebUI, etc.) can point at on port 8080.
+#
+# GET /api/tags returns {"models": [{"name":"auto:latest"}, {"name":"direct:latest"}]}
+# The client picks a profile name as its "model" — tiers are never exposed.
 #
 # [gateway]
 # client_port = 8080
@@ -143,27 +146,30 @@ max_auto_tier      = "cloud:expert" # ceiling tier (tiers[n-1]); remove to cap a
 # [[tiers]]
 # name    = "local:instant"
 # backend = "ollama"
-# model   = "qwen3:1.7b"
+# model   = "<fastest-model>"
 #
 # [[tiers]]
-# name    = "local:balanced"
+# name    = "local:fast"
 # backend = "ollama"
-# model   = "qwen3:8b"
+# model   = "<mid-model>"
 #
 # [[tiers]]
-# name    = "local:expert"
+# name    = "local:deep"
 # backend = "ollama"
-# model   = "qwen3:14b"
+# model   = "<most-capable-model>"
 #
-# [aliases]
-# "qwen-auto" = "local:instant"   # presented in /api/tags; classify overrides the actual tier
-#
-# [profiles.default]
+# # "auto" is what HA/Open WebUI picks from /api/tags.
+# # Complexity classification routes to instant, fast, or deep transparently.
+# [profiles.auto]
 # mode       = "classify"
-# classifier = "local:instant"    # fast 1.7b classifies; routes to :8b or :14b when needed
+# classifier = "local:instant"
+# max_auto_tier = "local:deep"
 #
-# With this config, HA sees "qwen-auto" in the model list. Selecting it routes
-# simple queries to qwen3:1.7b, moderate to qwen3:8b, complex to qwen3:14b.
+# # "direct" always hits the deepest model — no classification overhead.
+# [profiles.direct]
+# mode       = "dispatch"
+# classifier = "local:deep"
+# max_auto_tier = "local:deep"
 
 # ---------------------------------------------------------------------------
 # Clients — per-client API key → profile bindings
