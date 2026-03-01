@@ -29,6 +29,10 @@ pub fn router(state: Arc<RouterState>) -> Router {
         .route("/status", get(crate::api::status::status))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        // Ollama-compatible discovery — used by Home Assistant's Ollama integration
+        // and any client that enumerates models via the native Ollama API.
+        .route("/api/tags", get(list_models_ollama))
+        .route("/api/chat", post(chat_completions_ollama))
         .with_state(state)
 }
 
@@ -125,6 +129,232 @@ pub async fn list_models(State(state): State<Arc<RouterState>>) -> impl IntoResp
 
     let data: Vec<Value> = tiers.chain(aliases).collect();
     Json(json!({ "object": "list", "data": data }))
+}
+
+/// `GET /api/tags` — Ollama-compatible model discovery.
+///
+/// Returns all configured tiers and aliases in the Ollama model list format.
+/// This makes lm-gateway appear as an Ollama server to clients that use the
+/// native Ollama API for model enumeration (e.g. Home Assistant's Ollama
+/// integration, Open WebUI, etc.).
+///
+/// The `modified_at` and `digest` fields are synthetic — no real model files
+/// are stored by lm-gateway. Clients use `name` for subsequent `/api/chat`
+/// or `/v1/chat/completions` requests.
+pub async fn list_models_ollama(State(state): State<Arc<RouterState>>) -> impl IntoResponse {
+    let config = state.config();
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let tier_models = config.tiers.iter().map(|t| {
+        json!({
+            "name":        format!("{}:latest", t.name),
+            "model":       format!("{}:latest", t.name),
+            "modified_at": now,
+            "size":        0,
+            "digest":      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "details": {
+                "parent_model":       "",
+                "format":             "gguf",
+                "family":             "lm-gateway",
+                "families":           ["lm-gateway"],
+                "parameter_size":     &t.model,
+                "quantization_level": "auto"
+            }
+        })
+    });
+
+    let alias_models = config.aliases.keys().map(|alias| {
+        json!({
+            "name":        format!("{alias}:latest"),
+            "model":       format!("{alias}:latest"),
+            "modified_at": now,
+            "size":        0,
+            "digest":      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "details": {
+                "parent_model":       "",
+                "format":             "gguf",
+                "family":             "lm-gateway",
+                "families":           ["lm-gateway"],
+                "parameter_size":     "auto",
+                "quantization_level": "auto"
+            }
+        })
+    });
+
+    let models: Vec<Value> = tier_models.chain(alias_models).collect();
+    Json(json!({ "models": models }))
+}
+
+/// `POST /api/chat` — Ollama-compatible chat inference.
+///
+/// Accepts requests in Ollama's native format (`model`, `messages`, `stream`)
+/// and routes them through lm-gateway's tier/classify pipeline. The response is
+/// returned in Ollama format.
+///
+/// Non-streaming (`"stream": false` or absent): returns a single JSON object
+/// matching Ollama's response schema.
+///
+/// Streaming (`"stream": true`): returns newline-delimited JSON (NDJSON) in
+/// Ollama's streaming format, translated from the OpenAI SSE stream produced
+/// by the backend.
+///
+/// The `model` field may be any configured tier name, alias, or `auto-local`
+/// (or whichever alias is defined for the classify profile).
+pub async fn chat_completions_ollama(
+    State(state): State<Arc<RouterState>>,
+    request_id_ext: Option<Extension<RequestId>>,
+    client_profile: Option<Extension<ClientProfile>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    let expert_gate = headers
+        .get("x-claw-expert")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let req_id = request_id_ext.map(|Extension(id)| id.0);
+    let profile = client_profile.map(|Extension(p)| p.0);
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    // Strip trailing ":latest" from the model name (added by Ollama clients like HA).
+    let mut openai_body = body.clone();
+    if let Some(model_str) = openai_body.get("model").and_then(Value::as_str) {
+        let normalised = model_str.strip_suffix(":latest").unwrap_or(model_str).to_owned();
+        openai_body["model"] = json!(normalised);
+    }
+
+    if streaming {
+        let (stream, _entry) = crate::router::route_stream(
+            &state,
+            openai_body,
+            profile.as_deref(),
+            req_id.as_deref(),
+            expert_gate,
+        )
+        .await?;
+        // Translate OpenAI SSE stream → Ollama NDJSON stream.
+        let model_name = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("lm-gateway")
+            .to_owned();
+        let ndjson = sse_to_ollama_ndjson(model_name, stream);
+        return Ok(axum::response::Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(ndjson))
+            .expect("ollama_chat: failed to build streaming response"));
+    }
+
+    // Non-streaming path: route and convert response.
+    openai_body["stream"] = json!(false);
+    let (response, _entry) = crate::router::route(
+        &state,
+        openai_body,
+        profile.as_deref(),
+        req_id.as_deref(),
+        false,
+        expert_gate,
+    )
+    .await?;
+
+    let model_name = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("lm-gateway");
+    let content = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let eval_count = response
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt_count = response
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let ollama_response = json!({
+        "model":       model_name,
+        "created_at":  chrono::Utc::now().to_rfc3339(),
+        "message":     { "role": "assistant", "content": content },
+        "done":        true,
+        "done_reason": "stop",
+        "total_duration":     0,
+        "load_duration":      0,
+        "prompt_eval_count":  prompt_count,
+        "eval_count":         eval_count
+    });
+
+    Ok(Json(ollama_response).into_response())
+}
+
+/// Translate an OpenAI SSE stream into an Ollama-compatible NDJSON stream.
+///
+/// Each SSE `data: {...}` event is parsed; the delta content is extracted and
+/// emitted as an Ollama NDJSON chunk. The final `data: [DONE]` event produces
+/// the closing `"done": true` line.
+fn sse_to_ollama_ndjson(
+    model: String,
+    stream: crate::backends::SseStream,
+) -> impl futures_util::Stream<Item = anyhow::Result<bytes::Bytes>> {
+    use futures_util::StreamExt;
+
+    let model = std::sync::Arc::new(model);
+    let mut buf = String::new();
+
+    stream.flat_map(move |chunk_res| {
+        let model = model.clone();
+        let output: Vec<anyhow::Result<bytes::Bytes>> = match chunk_res {
+            Err(e) => vec![Err(e)],
+            Ok(bytes) => {
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                let mut out = Vec::new();
+
+                while let Some(pos) = buf.find("\n\n") {
+                    let event = buf[..pos].to_owned();
+                    buf = buf[pos + 2..].to_owned();
+
+                    for line in event.lines() {
+                        let data = line.strip_prefix("data: ").unwrap_or(line);
+                        if data == "[DONE]" || data.is_empty() {
+                            let done_line = serde_json::json!({
+                                "model":      model.as_str(),
+                                "created_at": chrono::Utc::now().to_rfc3339(),
+                                "message":    { "role": "assistant", "content": "" },
+                                "done":       true,
+                                "done_reason": "stop"
+                            });
+                            let mut s = done_line.to_string();
+                            s.push('\n');
+                            out.push(Ok(bytes::Bytes::from(s)));
+                        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            let content = v
+                                .pointer("/choices/0/delta/content")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            if !content.is_empty() {
+                                let chunk_line = serde_json::json!({
+                                    "model":      model.as_str(),
+                                    "created_at": chrono::Utc::now().to_rfc3339(),
+                                    "message":    { "role": "assistant", "content": content },
+                                    "done":       false
+                                });
+                                let mut s = chunk_line.to_string();
+                                s.push('\n');
+                                out.push(Ok(bytes::Bytes::from(s)));
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        };
+        futures_util::stream::iter(output)
+    })
 }
 
 #[cfg(test)]

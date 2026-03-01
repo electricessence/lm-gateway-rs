@@ -401,6 +401,7 @@ pub struct ProfileConfig {
     pub mode: RoutingMode,
 
     /// Fallback tier used when the model hint does not match any known tier or alias.
+    /// In `classify` mode, this tier is also used for the pre-flight classification call.
     pub classifier: String,
 
     /// Highest tier auto-escalation can reach without an explicit override.
@@ -419,15 +420,34 @@ pub struct ProfileConfig {
     /// (per-IP) still applies independently.
     #[serde(default)]
     pub rate_limit_rpm: Option<u32>,
+
+    /// System prompt used by `classify` mode to ask the classifier tier for a
+    /// routing label. The user message is appended verbatim after this prompt.
+    ///
+    /// Respond should be exactly one of: `simple`, `moderate`, or `complex`.
+    /// Defaults to [`DEFAULT_CLASSIFIER_PROMPT`] if not set.
+    #[serde(default)]
+    pub classifier_prompt: Option<String>,
 }
+
+/// Default classification prompt injected as the system message for `classify` mode.
+pub const DEFAULT_CLASSIFIER_PROMPT: &str = "\
+You are a routing classifier. Given the user message below, respond with ONLY ONE WORD \
+that describes its complexity:\n\
+  simple   — greetings, yes/no, basic facts, trivial single-step tasks\n\
+  moderate — explanations, summaries, simple code, multi-turn conversation\n\
+  complex  — deep reasoning, debugging, architecture, complex code, multi-step analysis\n\
+\n\
+Respond with exactly one word: simple, moderate, or complex. No punctuation, no explanation.";
 
 /// How the routing decision is made.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
-    /// Pre-classify with the classifier tier, then dispatch to the resolved tier.
+    /// Route directly to the tier matching the `model` hint in the request body.
     ///
-    /// Classifier never answers — it only routes. Adds ~200–800 ms latency.
+    /// Aliases are resolved first (`hint:fast` → `local:fast`). Unknown hints
+    /// fall back to the `classifier` tier. No extra inference calls are made.
     #[default]
     Dispatch,
 
@@ -436,6 +456,15 @@ pub enum RoutingMode {
     /// "Sufficient" is determined by heuristics (response length, absence of
     /// refusal phrases). Reduces cost for simple queries.
     Escalate,
+
+    /// Make a fast pre-flight call to the `classifier` tier to determine request
+    /// complexity, then dispatch to the appropriate tier.
+    ///
+    /// The classifier responds with one word (`simple`, `moderate`, or `complex`),
+    /// which is mapped to the first, middle, or last tier in the profile's auto
+    /// range (up to `max_auto_tier`). Adds ~200–600 ms latency before the main
+    /// inference call begins.
+    Classify,
 }
 
 impl std::fmt::Display for RoutingMode {
@@ -443,6 +472,7 @@ impl std::fmt::Display for RoutingMode {
         f.write_str(match self {
             Self::Dispatch => "dispatch",
             Self::Escalate => "escalate",
+            Self::Classify => "classify",
         })
     }
 }

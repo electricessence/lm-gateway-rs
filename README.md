@@ -30,9 +30,11 @@ LM Gateway RS sits between your application and your LLM backends, providing a u
 
 - **OpenAI-compatible API** — drop-in replacement endpoint for any client that speaks `/v1/chat/completions`
 - **Tier ladder** — define a cheapest→best progression of models, from local Ollama to cloud experts
-- **Two routing modes:**
+- **Three routing modes:**
   - **Dispatch** — classify intent with a fast local model, forward to the right tier immediately (predictable latency)
   - **Escalate** — try cheapest tier first; evaluate response quality; escalate only if needed (lowest average cost)
+  - **Classify** — single pre-flight call labels complexity as `simple`/`moderate`/`complex`, then dispatches directly to the appropriate tier (ideal for all-local deployments)
+- **Ollama-compatible endpoints** — `GET /api/tags` and `POST /api/chat` let any Ollama client (Home Assistant, Open WebUI, etc.) point at this gateway without modification
 - **Centralised credential management** — backends reference env vars; clients need no API keys
 - **Live admin UI** — dark dashboard at `:8081` with real-time traffic log, backend health, and config view
 - **In-memory traffic log** — ring-buffer; zero disk I/O, bounded memory, works on read-only filesystems
@@ -73,8 +75,10 @@ Open the admin UI: `http://localhost:8081/`
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| `POST` | `/v1/chat/completions` | Route a chat request |
+| `POST` | `/v1/chat/completions` | Route a chat request (OpenAI-compatible) |
 | `GET` | `/v1/models` | List available tiers and aliases |
+| `GET` | `/api/tags` | List models — Ollama-compatible format |
+| `POST` | `/api/chat` | Chat inference — Ollama-compatible format |
 | `GET` | `/healthz` | Liveness probe |
 
 Use any tier name or alias as the `model` field:
@@ -133,6 +137,65 @@ LMG_CONFIG=/path/to/config.toml   # default: /etc/lm-gateway/config.toml
 
 ---
 
+## Classify mode
+
+Classify mode performs a single, fast non-streaming call to a cheap "classifier" tier before the real request. The classifier responds with a single word — `simple`, `moderate`, or `complex` — and the gateway routes the actual request to:
+
+| Label | Tier selected |
+| ----- | ------------- |
+| `simple` | `tiers[0]` (cheapest / fastest) |
+| `moderate` | `tiers[n/2]` (mid-tier) |
+| `complex` | `tiers[n-1]` (most capable) |
+
+This gives you predictable, low-latency routing without needing cloud infrastructure. A 1.7b model classifying adds ~50–150 ms on the first call, then the right model answers.
+
+Minimal local config:
+
+```toml
+[backends.ollama]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+
+[[tiers]]
+name = "local:instant"   # maps to: simple
+backend = "ollama"
+model = "qwen3:1.7b"
+
+[[tiers]]
+name = "local:balanced"  # maps to: moderate
+backend = "ollama"
+model = "qwen3:8b"
+
+[[tiers]]
+name = "local:expert"    # maps to: complex
+backend = "ollama"
+model = "qwen3:14b"
+
+[profiles.default]
+mode       = "classify"
+classifier = "local:instant"
+```
+
+---
+
+## Ollama compatibility
+
+Two Ollama-format endpoints are always available on the client port:
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `GET /api/tags` | Returns all tiers and aliases in Ollama `GET /api/tags` format |
+| `POST /api/chat` | Accepts an Ollama chat request; routes through the normal pipeline; returns an Ollama response (or NDJSON stream) |
+
+This means you can point **Home Assistant**, **Open WebUI**, or any other Ollama client directly at this gateway. The client sees a list of "models" (your tier names and aliases) and can send requests without knowing anything about the underlying routing.
+
+```text
+Home Assistant → GET  lm-gateway-host:8080/api/tags  → sees "qwen-auto", "local:instant", …
+               → POST lm-gateway-host:8080/api/chat  → classify mode routes transparently
+```
+
+---
+
 ## Building
 
 ```bash
@@ -155,7 +218,7 @@ The release binary is statically linked and has no runtime dependencies beyond l
 src/
 ├── main.rs          Startup, dual listeners, graceful shutdown
 ├── config.rs        Config types, TOML loading, validation
-├── router.rs        Routing logic (dispatch + escalate modes)
+├── router.rs        Routing logic (dispatch + escalate + classify modes)
 ├── traffic.rs       In-memory ring-buffer traffic log
 ├── error.rs         Unified error type
 ├── backends/
@@ -166,7 +229,8 @@ src/
 └── api/
     ├── mod.rs       Router assembly
     ├── health.rs    GET /healthz
-    ├── client.rs    POST /v1/chat/completions, GET /v1/models
+    ├── client.rs    POST /v1/chat/completions, GET /v1/models,
+    │                GET /api/tags, POST /api/chat (Ollama compat)
     ├── admin.rs     Admin endpoints
     └── admin_ui.html Single-page admin dashboard
 ```

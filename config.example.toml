@@ -97,7 +97,7 @@ model   = "anthropic/claude-opus-4-5"
 # ---------------------------------------------------------------------------
 
 [profiles.default]
-mode               = "dispatch"       # "dispatch" | "escalate"
+mode               = "dispatch"       # "dispatch" | "escalate" | "classify"
 classifier         = "local:fast"     # tier used for intent classification (dispatch mode)
 max_auto_tier      = "cloud:economy"  # ceiling before expert_requires_flag kicks in
 expert_requires_flag = true           # client must set X-Claw-Expert: true to reach expert tier
@@ -110,6 +110,60 @@ classifier         = "local:fast"
 max_auto_tier      = "cloud:standard"
 expert_requires_flag = true
 # rate_limit_rpm = 60                # tighter quota for escalating (more expensive) callers
+
+# Classify profile — uses a fast model to label complexity before dispatching.
+# A single non-streaming call to `classifier` emits "simple", "moderate", or
+# "complex"; that label maps to tiers[0], tiers[n/2], or tiers[n-1] respectively.
+# Ideal for local-only deployments where every byte saved matters.
+#
+# Ollama-compatibility endpoints are active when this gateway is running:
+#   GET  /api/tags      — Ollama-format model discovery (all tiers + aliases)
+#   POST /api/chat      — Ollama-format chat (translates to/from OpenAI internally)
+# Point Home Assistant, Open WebUI, or any Ollama client at this gateway and it
+# will see your virtual "auto-local" model in the model list.
+[profiles.classify]
+mode               = "classify"
+classifier         = "local:fast"   # tier used for the pre-flight classification call
+max_auto_tier      = "cloud:expert" # ceiling tier (tiers[n-1]); remove to cap at mid
+# classifier_prompt = "..."         # override the built-in classification prompt
+
+# ---------------------------------------------------------------------------
+# Local-only classify example (3-tier Qwen3 — no cloud required)
+# ---------------------------------------------------------------------------
+# Uncomment and place this in a standalone config.toml to run a fully local
+# smart router that Home Assistant (or any Ollama client) can point at.
+#
+# [gateway]
+# client_port = 8080
+#
+# [backends.ollama]
+# provider = "ollama"
+# base_url = "http://127.0.0.1:11434"
+#
+# [[tiers]]
+# name    = "local:instant"
+# backend = "ollama"
+# model   = "qwen3:1.7b"
+#
+# [[tiers]]
+# name    = "local:balanced"
+# backend = "ollama"
+# model   = "qwen3:8b"
+#
+# [[tiers]]
+# name    = "local:expert"
+# backend = "ollama"
+# model   = "qwen3:14b"
+#
+# [aliases]
+# "qwen-auto" = "local:instant"   # presented in /api/tags; classify overrides the actual tier
+#
+# [profiles.default]
+# mode       = "classify"
+# classifier = "local:instant"    # fast 1.7b classifies; routes to :8b or :14b when needed
+#
+# With this config, HA sees "qwen-auto" in the model list. Selecting it routes
+# simple queries to qwen3:1.7b, moderate to qwen3:8b, complex to qwen3:14b.
 
 # ---------------------------------------------------------------------------
 # Clients — per-client API key → profile bindings

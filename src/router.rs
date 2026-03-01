@@ -1,6 +1,6 @@
 //! Request routing logic — the brain of lm-gateway.
 //!
-//! Two routing modes are supported:
+//! Three routing modes are supported:
 //!
 //! - **Dispatch** (`RoutingMode::Dispatch`): the `model` field in the request is
 //!   resolved through aliases and tier names to a target tier, then forwarded
@@ -11,6 +11,12 @@
 //!   If the response passes the [`is_sufficient`] heuristic it is returned;
 //!   otherwise the next tier up is tried. This minimises cost for simple queries
 //!   at the expense of higher tail latency on hard ones.
+//!
+//! - **Classify** (`RoutingMode::Classify`): a fast pre-flight inference call
+//!   to the `classifier` tier determines request complexity (`simple`, `moderate`,
+//!   or `complex`), which is mapped to the first, middle, or last tier in the
+//!   profile's auto range. The main inference call is then dispatched to that tier.
+//!   Adds ~200–600 ms latency from the classification call.
 
 use std::{
     collections::HashMap,
@@ -25,7 +31,7 @@ use tracing::{debug, warn};
 use crate::{
     api::rate_limit::RateLimiter,
     backends::{BackendClient, SseStream},
-    config::{Config, RoutingMode, TierConfig},
+    config::{Config, ProfileConfig, RoutingMode, TierConfig, DEFAULT_CLASSIFIER_PROMPT},
     traffic::{TrafficEntry, TrafficLog},
 };
 
@@ -129,6 +135,63 @@ impl RouterState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Classification helpers
+// ---------------------------------------------------------------------------
+
+/// The three complexity labels the classifier tier is expected to return.
+#[derive(Debug, Clone, Copy)]
+enum ClassLabel {
+    Simple,
+    Moderate,
+    Complex,
+}
+
+impl std::fmt::Display for ClassLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ClassLabel::Simple => "simple",
+            ClassLabel::Moderate => "moderate",
+            ClassLabel::Complex => "complex",
+        })
+    }
+}
+
+/// Parse a classification label from the classifier's response.
+///
+/// Looks at the first whitespace-delimited token in the response content and
+/// normalises it. Numeric labels (`1`/`2`/`3`) and common synonyms are also
+/// accepted. Returns `Moderate` if the token is unrecognised (safe middle ground).
+fn parse_classification_label(response: &Value) -> ClassLabel {
+    let content = response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    let first = content
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        // Strip leading/trailing punctuation so "simple." or "[complex]" still match.
+        .trim_matches(|c: char| !c.is_alphanumeric());
+
+    match first {
+        "simple" | "1" | "easy" | "basic" | "trivial" | "low" => ClassLabel::Simple,
+        "moderate" | "2" | "medium" | "normal" | "mid" => ClassLabel::Moderate,
+        "complex" | "3" | "hard" | "difficult" | "expert" | "high" => ClassLabel::Complex,
+        other => {
+            debug!(label = other, "unrecognised classification label — defaulting to moderate");
+            ClassLabel::Moderate
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route entry points
+// ---------------------------------------------------------------------------
+
 /// Route a `/v1/chat/completions` request body to the appropriate backend tier.
 ///
 /// - Resolves the `model` field through aliases and tier names.
@@ -170,6 +233,9 @@ pub async fn route(
         RoutingMode::Escalate => {
             escalate(state, &mut request_body, profile, stream).await?
         }
+        RoutingMode::Classify => {
+            classify_and_dispatch(state, &mut request_body, profile, stream).await?
+        }
     };
 
     // Enrich entry with request-level context only available at route() scope,
@@ -180,6 +246,7 @@ pub async fn route(
         .with_routing_mode(match profile.mode {
             RoutingMode::Dispatch => "dispatch",
             RoutingMode::Escalate => "escalate",
+            RoutingMode::Classify => "classify",
         });
     if let Some(id) = request_id {
         entry = entry.with_id(id);
@@ -413,10 +480,118 @@ async fn escalate(
     anyhow::bail!("all tiers exhausted without a sufficient response")
 }
 
+/// Mode C: pre-flight classification call, then dispatch to the resolved tier.
+///
+/// Extracts the last user message, makes a fast non-streaming inference call
+/// to the `classifier` tier with the configured prompt, parses the one-word
+/// label, and maps it to a tier from the profile's auto range:
+///
+/// - `simple`   → `tiers[0]`     (cheapest)
+/// - `moderate` → `tiers[n / 2]` (middle)
+/// - `complex`  → `tiers[n - 1]` (most capable, bounded by `max_auto_tier`)
+///
+/// Falls back to the classifier tier itself if the classification call fails or
+/// there is no user message to classify.
+async fn classify_and_dispatch(
+    state: &RouterState,
+    body: &mut Value,
+    profile: &ProfileConfig,
+    stream: bool,
+) -> anyhow::Result<(Value, TrafficEntry)> {
+    let config = state.config();
+
+    // Find the classifier tier (used for the classification call).
+    let classifier_tier = config
+        .tiers
+        .iter()
+        .find(|t| t.name == profile.classifier)
+        .context("classifier tier not found in config")?;
+
+    let backend_cfg = config
+        .backends
+        .get(&classifier_tier.backend)
+        .with_context(|| format!("backend `{}` not in config", classifier_tier.backend))?
+        .clone();
+
+    // Extract the last user message to classify.
+    let user_text = body
+        .pointer("/messages")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .map(|s| s.to_owned());
+
+    let Some(user_text) = user_text else {
+        debug!("no user message found — bypassing classification, using classifier tier");
+        return dispatch(state, body, classifier_tier, stream).await;
+    };
+
+    let system_prompt = profile
+        .classifier_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_CLASSIFIER_PROMPT);
+
+    // Build candidate tier slice (first tier up to max_auto_tier inclusive).
+    let max_idx = config
+        .tiers
+        .iter()
+        .position(|t| t.name == profile.max_auto_tier)
+        .unwrap_or(config.tiers.len().saturating_sub(1));
+    let candidates: &[TierConfig] = &config.tiers[..=max_idx];
+
+    // Make the classification call (non-streaming, max_tokens=10, temp=0).
+    let classifier_body = serde_json::json!({
+        "model": classifier_tier.model,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user",   "content": &user_text   }
+        ],
+        "stream": false,
+        "max_tokens": 10,
+        "temperature": 0.0
+    });
+
+    let client = BackendClient::new(&backend_cfg)?;
+    let label = match client.chat_completions(classifier_body).await {
+        Ok(response) => {
+            let label = parse_classification_label(&response);
+            debug!(%label, "classified request");
+            label
+        }
+        Err(e) => {
+            warn!(err = %e, "classification call failed — defaulting to first tier");
+            ClassLabel::Simple
+        }
+    };
+
+    // Map label → tier index.
+    let n = candidates.len();
+    let tier_idx = match label {
+        ClassLabel::Simple   => 0,
+        ClassLabel::Moderate => n / 2,
+        ClassLabel::Complex  => n.saturating_sub(1),
+    };
+    let target_tier = &candidates[tier_idx];
+
+    debug!(
+        %label,
+        tier = %target_tier.name,
+        "classify routing resolved"
+    );
+
+    dispatch(state, body, target_tier, stream).await
+}
+
 /// Route a streaming `/v1/chat/completions` request.
 ///
 /// Streaming bypasses escalation — the first matching tier is dispatched to
 /// directly, and the backend's SSE output is returned as an [`SseStream`].
+/// In `classify` mode a non-streaming pre-flight call determines which tier to
+/// stream from; escalation mode falls back to dispatch behaviour.
 /// All backends produce OpenAI-compatible SSE: OpenAI-compatible and Ollama
 /// backends proxy bytes verbatim; Anthropic translates on-the-fly.
 #[tracing::instrument(skip(state, request_body), fields(profile = profile_name.unwrap_or("default")))]
@@ -433,8 +608,88 @@ pub async fn route_stream(
         .profile(profile_name)
         .context("no matching profile and no default profile configured")?;
 
-    let (target_tier, model_hint) =
+    let (resolved_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
+
+    // In classify mode, run a non-streaming classification call first to pick
+    // the best tier, then stream from that tier instead of the resolved one.
+    let target_tier_name: String = if profile.mode == RoutingMode::Classify {
+        let classifier_tier = config
+            .tiers
+            .iter()
+            .find(|t| t.name == profile.classifier)
+            .context("classifier tier not found in config")?;
+
+        let backend_cfg = config
+            .backends
+            .get(&classifier_tier.backend)
+            .with_context(|| format!("backend `{}` not in config", classifier_tier.backend))?
+            .clone();
+
+        let user_text = request_body
+            .pointer("/messages")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            })
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .map(|s| s.to_owned());
+
+        if let Some(user_text) = user_text {
+            let system_prompt = profile
+                .classifier_prompt
+                .as_deref()
+                .unwrap_or(DEFAULT_CLASSIFIER_PROMPT);
+
+            let max_idx = config
+                .tiers
+                .iter()
+                .position(|t| t.name == profile.max_auto_tier)
+                .unwrap_or(config.tiers.len().saturating_sub(1));
+            let candidates = &config.tiers[..=max_idx];
+            let n = candidates.len();
+
+            let classifier_body = serde_json::json!({
+                "model": classifier_tier.model,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user",   "content": &user_text   }
+                ],
+                "stream": false,
+                "max_tokens": 10,
+                "temperature": 0.0
+            });
+
+            let client = BackendClient::new(&backend_cfg)?;
+            let label = match client.chat_completions(classifier_body).await {
+                Ok(r) => parse_classification_label(&r),
+                Err(e) => {
+                    warn!(err = %e, "stream classify call failed — defaulting to first tier");
+                    ClassLabel::Simple
+                }
+            };
+
+            let idx = match label {
+                ClassLabel::Simple   => 0,
+                ClassLabel::Moderate => n / 2,
+                ClassLabel::Complex  => n.saturating_sub(1),
+            };
+            debug!(%label, tier = %candidates[idx].name, "stream classify resolved");
+            candidates[idx].name.clone()
+        } else {
+            classifier_tier.name.clone()
+        }
+    } else {
+        resolved_tier.name.clone()
+    };
+
+    let target_tier = config
+        .tiers
+        .iter()
+        .find(|t| t.name == target_tier_name)
+        .with_context(|| format!("resolved tier `{target_tier_name}` not found"))?;
 
     let backend_cfg = config
         .backends
@@ -453,6 +708,11 @@ pub async fn route_stream(
     let stream_response = client.chat_completions_stream(request_body).await?;
     let latency_ms = t0.elapsed().as_millis() as u64;
 
+    let routing_mode = match profile.mode {
+        RoutingMode::Classify => "classify+stream",
+        _ => "stream",
+    };
+
     // Latency here is time-to-first-byte (connection + headers), not full response.
     let mut entry = TrafficEntry::new(
         target_tier.name.clone(),
@@ -462,7 +722,7 @@ pub async fn route_stream(
     )
     .with_profile(profile_name)
     .with_requested_model(&model_hint)
-    .with_routing_mode("stream");
+    .with_routing_mode(routing_mode);
     if let Some(id) = request_id {
         entry = entry.with_id(id);
     }
