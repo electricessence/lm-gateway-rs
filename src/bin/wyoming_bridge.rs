@@ -160,38 +160,65 @@ fn merge_json(mut base: Value, extra: Value) -> Value {
 // Wyoming Info responses
 // ---------------------------------------------------------------------------
 
+fn attribution() -> Value {
+    json!({
+        "name": "wyoming-bridge (lm-gateway-rs)",
+        "url":  "https://github.com/electricessence/lm-gateway-rs"
+    })
+}
+
 fn asr_info() -> Value {
     json!({
         "asr": [{
+            "name":        "wyoming-bridge-asr",
+            "attribution": attribution(),
+            "installed":   true,
+            "description": "whisper.cpp via HTTP bridge",
+            "version":     null,
             "models": [{
-                "name":        "whisper",
-                "languages":   ["en"],
-                "attribution": {
-                    "name": "wyoming-bridge (lm-gateway-rs)",
-                    "url":  "https://github.com/electricessence/lm-gateway-rs"
-                },
+                "name":        "whisper-1",
+                "attribution": attribution(),
                 "installed":   true,
-                "description": "whisper.cpp via HTTP bridge"
-            }]
-        }]
+                "description": "Whisper via HTTP",
+                "version":     null,
+                "languages":   ["en"]
+            }],
+            "supports_transcript_streaming": false
+        }],
+        "tts":    [],
+        "handle": [],
+        "intent": [],
+        "wake":   [],
+        "mic":    [],
+        "snd":    []
     })
 }
 
 fn tts_info(voice: &str) -> Value {
     json!({
+        "asr": [],
         "tts": [{
-            "models": [{
-                "name":        "kokoro",
-                "languages":   ["en"],
-                "attribution": {
-                    "name": "wyoming-bridge (lm-gateway-rs)",
-                    "url":  "https://github.com/electricessence/lm-gateway-rs"
-                },
+            "name":        "wyoming-bridge-tts",
+            "attribution": attribution(),
+            "installed":   true,
+            "description": "Kokoro TTS via HTTP bridge",
+            "version":     null,
+            "voices": [{
+                "name":        voice,
+                "attribution": attribution(),
                 "installed":   true,
-                "description": "Kokoro TTS via HTTP bridge"
+                "description": "Kokoro voice",
+                "version":     null,
+                "languages":   ["en"],
+                "speakers":    null
             }],
-            "speakers": [{ "name": voice }]
-        }]
+            "supports_synthesize_streaming": false
+        }],
+        "handle": [],
+        "intent": [],
+        "wake":   [],
+        "mic":    [],
+        "snd":    []
     })
 }
 
