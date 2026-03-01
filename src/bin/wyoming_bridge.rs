@@ -273,6 +273,9 @@ async fn run_stt(stream: TcpStream, config: &BridgeConfig, client: &Client) -> R
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    // Wyoming servers send info immediately on connect; HA does not send describe first.
+    Msg::write(&mut write_half, "info", asr_info(), &[]).await?;
+
     let mut pcm_buf: Vec<u8> = Vec::new();
     let mut audio_rate: u32 = 16_000;
     let mut audio_channels: u16 = 1;
@@ -282,6 +285,7 @@ async fn run_stt(stream: TcpStream, config: &BridgeConfig, client: &Client) -> R
         let msg = Msg::read(&mut reader).await?;
         match msg.type_.as_str() {
             "describe" => {
+                // Re-send info if HA asks again (e.g. during re-discovery).
                 Msg::write(&mut write_half, "info", asr_info(), &[]).await?;
             }
             "transcribe" => {
@@ -364,10 +368,14 @@ async fn run_tts(stream: TcpStream, config: &BridgeConfig, client: &Client) -> R
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
+    // Wyoming servers send info immediately on connect; HA does not send describe first.
+    Msg::write(&mut write_half, "info", tts_info(&config.tts_voice), &[]).await?;
+
     loop {
         let msg = Msg::read(&mut reader).await?;
         match msg.type_.as_str() {
             "describe" => {
+                // Re-send info if HA asks again.
                 Msg::write(&mut write_half, "info", tts_info(&config.tts_voice), &[]).await?;
             }
             "synthesize" => {
