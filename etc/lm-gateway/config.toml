@@ -1,5 +1,5 @@
-# lm-gateway configuration — language.cortex.lan
-# 3-tier local classify mode — routes to qwen3:1.7b / 8b / 14b via Ollama
+# lm-gateway configuration — 3-tier local classify mode
+# Routes to qwen3:1.7b / 8b / 14b via Ollama
 
 [gateway]
 client_port          = 8080
