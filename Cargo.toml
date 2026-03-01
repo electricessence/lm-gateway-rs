@@ -11,6 +11,10 @@ readme = "README.md"
 name = "lm-gateway"
 path = "src/main.rs"
 
+[[bin]]
+name = "wyoming-bridge"
+path = "src/bin/wyoming_bridge.rs"
+
 [dependencies]
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }
@@ -25,7 +29,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # TLS is selected via features — see [features] below.
 # Default (dev/Windows): native-tls (uses platform TLS, no extra C deps)
 # Docker build: --no-default-features --features rustls-tls (pure Rust, static-friendly)
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
