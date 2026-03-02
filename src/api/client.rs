@@ -357,10 +357,17 @@ pub async fn chat_completions_ollama(
     };
 
     let model_name = model_name.as_str();
-    let content = response
-        .pointer("/choices/0/message/content")
+    let choice_message = response.pointer("/choices/0/message");
+    let content = choice_message
+        .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    // Pass tool_calls through so HA's Ollama integration can execute service calls.
+    let tool_calls_opt = choice_message
+        .and_then(|m| m.get("tool_calls"))
+        .filter(|v| !v.is_null())
+        .filter(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true))
+        .cloned();
     let eval_count = response
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64)
@@ -370,10 +377,15 @@ pub async fn chat_completions_ollama(
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
+    let mut message = json!({ "role": "assistant", "content": content });
+    if let Some(tc) = tool_calls_opt {
+        message["tool_calls"] = tc;
+    }
+
     let ollama_response = json!({
         "model":       model_name,
         "created_at":  chrono::Utc::now().to_rfc3339(),
-        "message":     { "role": "assistant", "content": content },
+        "message":     message,
         "done":        true,
         "done_reason": "stop",
         "total_duration":     0,
@@ -387,58 +399,140 @@ pub async fn chat_completions_ollama(
 
 /// Translate an OpenAI SSE stream into an Ollama-compatible NDJSON stream.
 ///
-/// Each SSE `data: {...}` event is parsed; the delta content is extracted and
-/// emitted as an Ollama NDJSON chunk. The final `data: [DONE]` event produces
-/// the closing `"done": true` line.
+/// Content delta chunks are forwarded immediately. `tool_calls` deltas are
+/// accumulated across chunks and emitted in full on the closing `done: true`
+/// line, which is what the Ollama Python client and Home Assistant expect.
+/// This allows HA's Ollama conversation integration to receive properly-formed
+/// `tool_calls` and execute service calls rather than seeing empty content.
 fn sse_to_ollama_ndjson(
     model: String,
     stream: crate::backends::SseStream,
 ) -> impl futures_util::Stream<Item = anyhow::Result<bytes::Bytes>> {
     use futures_util::StreamExt;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
-    let model = std::sync::Arc::new(model);
-    let mut buf = String::new();
+    /// Accumulates OpenAI streaming tool_call deltas by index.
+    #[derive(Default)]
+    struct ToolCallBuilder {
+        id:        String,
+        name:      String,
+        arguments: String,
+    }
+
+    struct State {
+        buf:        String,
+        tool_calls: BTreeMap<usize, ToolCallBuilder>,
+    }
+
+    let model = Arc::new(model);
+    let state = Arc::new(Mutex::new(State {
+        buf:        String::new(),
+        tool_calls: BTreeMap::new(),
+    }));
 
     stream.flat_map(move |chunk_res| {
-        let model = model.clone();
+        let model  = model.clone();
+        let state  = state.clone();
+        let mut st = state.lock().expect("sse_to_ollama_ndjson state lock");
+
         let output: Vec<anyhow::Result<bytes::Bytes>> = match chunk_res {
             Err(e) => vec![Err(e)],
             Ok(bytes) => {
-                buf.push_str(&String::from_utf8_lossy(&bytes));
+                st.buf.push_str(&String::from_utf8_lossy(&bytes));
                 let mut out = Vec::new();
 
-                while let Some(pos) = buf.find("\n\n") {
-                    let event = buf[..pos].to_owned();
-                    buf = buf[pos + 2..].to_owned();
+                while let Some(pos) = st.buf.find("\n\n") {
+                    let event = st.buf[..pos].to_owned();
+                    st.buf = st.buf[pos + 2..].to_owned();
 
                     for line in event.lines() {
                         let data = line.strip_prefix("data: ").unwrap_or(line);
+
                         if data == "[DONE]" || data.is_empty() {
+                            // Assemble accumulated tool_calls (BTreeMap keeps index order).
+                            let assembled: Vec<serde_json::Value> = st
+                                .tool_calls
+                                .iter()
+                                .map(|(_, b)| serde_json::json!({
+                                    "id":   b.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name":      b.name,
+                                        "arguments": b.arguments
+                                    }
+                                }))
+                                .collect();
+
+                            let mut done_message =
+                                serde_json::json!({ "role": "assistant", "content": "" });
+                            if !assembled.is_empty() {
+                                done_message["tool_calls"] = serde_json::json!(assembled);
+                            }
+
                             let done_line = serde_json::json!({
-                                "model":      model.as_str(),
-                                "created_at": chrono::Utc::now().to_rfc3339(),
-                                "message":    { "role": "assistant", "content": "" },
-                                "done":       true,
+                                "model":       model.as_str(),
+                                "created_at":  chrono::Utc::now().to_rfc3339(),
+                                "message":     done_message,
+                                "done":        true,
                                 "done_reason": "stop"
                             });
                             let mut s = done_line.to_string();
                             s.push('\n');
                             out.push(Ok(bytes::Bytes::from(s)));
-                        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                            let content = v
-                                .pointer("/choices/0/delta/content")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("");
-                            if !content.is_empty() {
-                                let chunk_line = serde_json::json!({
-                                    "model":      model.as_str(),
-                                    "created_at": chrono::Utc::now().to_rfc3339(),
-                                    "message":    { "role": "assistant", "content": content },
-                                    "done":       false
-                                });
-                                let mut s = chunk_line.to_string();
-                                s.push('\n');
-                                out.push(Ok(bytes::Bytes::from(s)));
+                        } else if let Ok(v) =
+                            serde_json::from_str::<serde_json::Value>(data)
+                        {
+                            // Accumulate tool_call deltas.
+                            if let Some(tc_arr) = v
+                                .pointer("/choices/0/delta/tool_calls")
+                                .and_then(serde_json::Value::as_array)
+                            {
+                                for delta in tc_arr {
+                                    let idx = delta
+                                        .get("index")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .unwrap_or(0) as usize;
+                                    let entry =
+                                        st.tool_calls.entry(idx).or_default();
+                                    if let Some(id) =
+                                        delta.get("id").and_then(serde_json::Value::as_str)
+                                    {
+                                        entry.id = id.to_owned();
+                                    }
+                                    if let Some(func) = delta.get("function") {
+                                        if let Some(name) = func
+                                            .get("name")
+                                            .and_then(serde_json::Value::as_str)
+                                        {
+                                            entry.name.push_str(name);
+                                        }
+                                        if let Some(args) = func
+                                            .get("arguments")
+                                            .and_then(serde_json::Value::as_str)
+                                        {
+                                            entry.arguments.push_str(args);
+                                        }
+                                    }
+                                }
+                                // Don't emit a content chunk for tool_call-only deltas.
+                            } else {
+                                // Regular content delta.
+                                let content = v
+                                    .pointer("/choices/0/delta/content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                if !content.is_empty() {
+                                    let chunk_line = serde_json::json!({
+                                        "model":      model.as_str(),
+                                        "created_at": chrono::Utc::now().to_rfc3339(),
+                                        "message":    { "role": "assistant", "content": content },
+                                        "done":       false
+                                    });
+                                    let mut s = chunk_line.to_string();
+                                    s.push('\n');
+                                    out.push(Ok(bytes::Bytes::from(s)));
+                                }
                             }
                         }
                     }
