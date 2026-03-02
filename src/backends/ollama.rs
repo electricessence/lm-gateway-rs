@@ -91,6 +91,32 @@ impl OllamaAdapter {
         Ok(Box::pin(stream))
     }
 
+    /// Send `POST /api/chat` with `stream: true` and return an [`SseStream`] of raw NDJSON.
+    ///
+    /// Unlike [`chat_completions_stream`], this uses Ollama's native endpoint which
+    /// honours Ollama-specific fields such as `think: false`. The returned bytes are
+    /// newline-delimited JSON (not SSE) and should be proxied directly to callers
+    /// that expect Ollama native format rather than being passed through
+    /// `sse_to_ollama_ndjson`.
+    pub async fn native_chat_stream(&self, mut body: Value) -> anyhow::Result<SseStream> {
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("keep_alive").or_insert(serde_json::json!(-1));
+            obj.insert("stream".into(), serde_json::json!(true));
+        }
+        let url = format!("{}/api/chat", self.base_url);
+        let response = self
+            .stream_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} (native streaming)"))?;
+        let stream = response
+            .bytes_stream()
+            .map(|r| r.map_err(anyhow::Error::from));
+        Ok(Box::pin(stream))
+    }
+
     /// Send a classification request via Ollama's native `/api/chat` endpoint.
     ///
     /// The native path honours Ollama-specific request fields such as `think`,

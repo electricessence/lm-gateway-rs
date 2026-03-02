@@ -680,7 +680,8 @@ pub async fn route_stream(
     profile_name: Option<&str>,
     request_id: Option<&str>,
     expert_gate: bool,
-) -> anyhow::Result<(SseStream, TrafficEntry)> {
+    use_native: bool,
+) -> anyhow::Result<(SseStream, TrafficEntry, bool)> {
     let profile_name = profile_name.unwrap_or("default");
     let config = state.config();
     let profile = config
@@ -803,7 +804,11 @@ pub async fn route_stream(
 
     let client = BackendClient::new(backend_cfg)?;
     let t0 = std::time::Instant::now();
-    let stream_response = client.chat_completions_stream(request_body).await?;
+    let (stream_response, is_native_ndjson) = if use_native {
+        client.native_chat_stream(request_body).await?
+    } else {
+        (client.chat_completions_stream(request_body).await?, false)
+    };
     let latency_ms = t0.elapsed().as_millis() as u64;
 
     let routing_mode = match profile.mode {
@@ -827,7 +832,7 @@ pub async fn route_stream(
 
     state.traffic.push(entry.clone());
 
-    Ok((stream_response, entry))
+    Ok((stream_response, entry, is_native_ndjson))
 }
 
 /// Decide whether a backend response is good enough to return or should be escalated.

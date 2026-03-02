@@ -98,6 +98,25 @@ impl BackendClient {
         }
     }
 
+    /// Stream via the backend's native endpoint when available.
+    ///
+    /// For Ollama this uses `/api/chat` which honours Ollama-specific fields
+    /// such as `think: false`. Returns `(stream, is_native_ndjson)` where
+    /// `is_native_ndjson == true` means the bytes are already Ollama NDJSON
+    /// and should be proxied directly without SSE→NDJSON conversion.
+    ///
+    /// All other backends fall back to [`chat_completions_stream`] (SSE) and
+    /// return `false`.
+    pub async fn native_chat_stream(
+        &self,
+        request: Value,
+    ) -> anyhow::Result<(SseStream, bool)> {
+        match self {
+            Self::Ollama(a) => Ok((a.native_chat_stream(request).await?, true)),
+            _ => Ok((self.chat_completions_stream(request).await?, false)),
+        }
+    }
+
     /// Send a classification request to the backend.
     ///
     /// For Ollama backends this routes to the native `/api/chat` endpoint so

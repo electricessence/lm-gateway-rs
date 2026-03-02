@@ -150,8 +150,8 @@ pub async fn chat_completions(
         .to_owned();
 
     if streaming {
-        match crate::router::route_stream(&state, body, profile.as_deref(), req_id.as_deref(), expert_gate).await {
-            Ok((stream, _entry)) => return Ok(proxy_sse(stream)),
+        match crate::router::route_stream(&state, body, profile.as_deref(), req_id.as_deref(), expert_gate, false).await {
+            Ok((stream, _entry, _is_native)) => return Ok(proxy_sse(stream)),
             Err(e) => return Ok(Json(error_openai_response(&e, &model_name)).into_response()),
         }
     }
@@ -323,10 +323,20 @@ pub async fn chat_completions_ollama(
             effective_profile,
             req_id.as_deref(),
             expert_gate,
+            true, // use native /api/chat for Ollama — honours think:false
         )
         .await
         {
-            Ok((stream, _entry)) => {
+            Ok((stream, _entry, is_native)) => {
+                if is_native {
+                    // Native NDJSON from /api/chat — passthrough directly.
+                    return Ok(axum::response::Response::builder()
+                        .header("content-type", "application/x-ndjson")
+                        .header("cache-control", "no-cache")
+                        .header("x-accel-buffering", "no")
+                        .body(Body::from_stream(stream))
+                        .expect("ollama_chat: failed to build native ndjson response"));
+                }
                 // Translate OpenAI SSE stream → Ollama NDJSON stream.
                 let ndjson = sse_to_ollama_ndjson(model_name.clone(), stream);
                 return Ok(axum::response::Response::builder()
@@ -363,11 +373,30 @@ pub async fn chat_completions_ollama(
         .and_then(Value::as_str)
         .unwrap_or("");
     // Pass tool_calls through so HA's Ollama integration can execute service calls.
+    // OpenAI format has arguments as a JSON string; Ollama native format expects a dict.
     let tool_calls_opt = choice_message
         .and_then(|m| m.get("tool_calls"))
         .filter(|v| !v.is_null())
         .filter(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true))
-        .cloned();
+        .cloned()
+        .map(|tc| {
+            let arr = tc.as_array().cloned().unwrap_or_default();
+            let fixed: Vec<serde_json::Value> = arr.into_iter().map(|mut call| {
+                if let Some(args_str) = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_owned())
+                {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                        if let Some(func) = call.get_mut("function") {
+                            func["arguments"] = parsed;
+                        }
+                    }
+                }
+                call
+            }).collect();
+            serde_json::Value::Array(fixed)
+        });
     let eval_count = response
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64)
@@ -422,12 +451,14 @@ fn sse_to_ollama_ndjson(
 
     struct State {
         buf:        String,
+        content:    String,
         tool_calls: BTreeMap<usize, ToolCallBuilder>,
     }
 
     let model = Arc::new(model);
     let state = Arc::new(Mutex::new(State {
         buf:        String::new(),
+        content:    String::new(),
         tool_calls: BTreeMap::new(),
     }));
 
@@ -454,18 +485,25 @@ fn sse_to_ollama_ndjson(
                             let assembled: Vec<serde_json::Value> = st
                                 .tool_calls
                                 .iter()
-                                .map(|(_, b)| serde_json::json!({
-                                    "id":   b.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name":      b.name,
-                                        "arguments": b.arguments
-                                    }
-                                }))
+                                .map(|(_, b)| {
+                                    // Ollama native format requires arguments as a dict,
+                                    // not the JSON string that OpenAI SSE carries.
+                                    let args: serde_json::Value =
+                                        serde_json::from_str(&b.arguments)
+                                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                                    serde_json::json!({
+                                        "id":   b.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name":      b.name,
+                                            "arguments": args
+                                        }
+                                    })
+                                })
                                 .collect();
 
                             let mut done_message =
-                                serde_json::json!({ "role": "assistant", "content": "" });
+                                serde_json::json!({ "role": "assistant", "content": st.content });
                             if !assembled.is_empty() {
                                 done_message["tool_calls"] = serde_json::json!(assembled);
                             }
@@ -523,6 +561,7 @@ fn sse_to_ollama_ndjson(
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("");
                                 if !content.is_empty() {
+                                    st.content.push_str(content);
                                     let chunk_line = serde_json::json!({
                                         "model":      model.as_str(),
                                         "created_at": chrono::Utc::now().to_rfc3339(),
