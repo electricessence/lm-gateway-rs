@@ -43,7 +43,12 @@ impl OllamaAdapter {
     }
 
     /// Forward a chat completions request via Ollama's OpenAI-compat endpoint.
-    pub async fn chat_completions(&self, body: Value) -> anyhow::Result<Value> {
+    pub async fn chat_completions(&self, mut body: Value) -> anyhow::Result<Value> {
+        // Keep the model loaded in Ollama's memory indefinitely so subsequent
+        // requests don't pay the cold-start penalty (can be 10–30 s for 8b models).
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("keep_alive").or_insert(serde_json::json!(-1));
+        }
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self
             .client
@@ -67,7 +72,11 @@ impl OllamaAdapter {
     /// Send `POST /v1/chat/completions` and return an [`SseStream`] for proxying.
     ///
     /// The backend response bytes are forwarded verbatim.
-    pub async fn chat_completions_stream(&self, body: Value) -> anyhow::Result<SseStream> {
+    pub async fn chat_completions_stream(&self, mut body: Value) -> anyhow::Result<SseStream> {
+        // Keep the model hot after streaming responses too.
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("keep_alive").or_insert(serde_json::json!(-1));
+        }
         let url = format!("{}/v1/chat/completions", self.base_url);
         let response = self
             .stream_client
