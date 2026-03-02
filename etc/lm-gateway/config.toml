@@ -72,6 +72,7 @@ mode          = "dispatch"
 classifier    = "local:balanced"
 max_auto_tier = "local:expert"
 system_prompt = """\
+/no_think
 You are a voice-activated assistant integrated with Home Assistant.
 
 DEVICE COMMANDS (lights, locks, switches, climate, covers):
