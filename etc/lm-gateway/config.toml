@@ -91,28 +91,41 @@ profile = "ha-auto"
 
 # "ha-auto:latest" — what Home Assistant sees and uses.
 #
-# 2-label classify: qwen3:1.7b pre-flight routes to the right tier.
-# Default is deep (14b). Only instant (1.7b) for pure greetings/facts.
-#   deep    — device command, state query, tool call, anything home-related
-#   instant — greeting, chitchat, or pure factual question (no home action)
+# 3-label classify: qwen3:1.7b pre-flight routes to the right tier.
+#   fast    — single unambiguous device command (8b)
+#   deep    — state query, context phrase, multi-entity (14b)
+#   instant — greeting, chitchat, general trivia with no home action (1.7b)
 [profiles.ha-auto]
 mode              = "classify"
 classifier        = "local:instant"
 max_auto_tier     = "local:max"
 classifier_prompt = """\
-Route this Home Assistant request.
+Route this Home Assistant request. Reply with one word: instant, fast, or deep.
 
-DEEP — use for any of these:
-- Controls a device: light, switch, lock, thermostat, fan, cover, climate, AC, plug, media, speaker
-- Action words: turn on/off, set, dim, brighten, open, close, lock, unlock, play, pause, stop, adjust
-- Queries home state: is X on/off/open/locked/playing, what is the temperature/status
-- Departure or arrival: leaving, I'm home, goodnight, heading out
+  Turn on the kitchen lights                               -> fast
+  Lock the front door                                      -> fast
+  Set the thermostat to 72                                 -> fast
+  Dim the office light to 40%                              -> fast
+  Play music in the bedroom                                -> fast
+  Turn off the TV                                          -> fast
+  What is the living room temperature?                     -> deep
+  What is the temperature outside?                         -> deep
+  Are any lights on downstairs?                            -> deep
+  Is the garage door open?                                 -> deep
+  Turn off all the lights                                  -> deep
+  Lock everything up                                       -> deep
+  Goodnight                                                -> deep
+  Good morning                                             -> deep
+  I'm home                                                 -> deep
+  I'm leaving                                              -> deep
+  Heading out                                              -> deep
+  Hi                                                       -> instant
+  How are you                                              -> instant
+  Tell me a joke                                           -> instant
+  What's the capital of France?                            -> instant
+  What's 2+2?                                              -> instant
 
-INSTANT — only if:
-- Pure greeting, chitchat, joke request, or entertainment with no home action (hi, tell me a joke)
-- General knowledge question unrelated to the home (time, math, news, general facts)
-
-Reply with exactly one word: instant or deep.\
+Reply with one word only: instant, fast, or deep.\
 """
 system_prompt = """\
 You are a voice-activated assistant integrated with Home Assistant.

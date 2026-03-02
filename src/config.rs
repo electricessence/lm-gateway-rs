@@ -479,38 +479,29 @@ pub struct ProfileConfig {
 /// to fix false-positive fast-think on "Could you dim X and set Y" style requests.
 /// Override per-profile with `classifier_prompt` if your workload needs a different rubric.
 pub const DEFAULT_CLASSIFIER_PROMPT: &str = "\
-You are a request router for a Home Assistant voice/chat assistant.\n\
-Reply with one word only.\n\
-Labels: instant, instant-think, fast, fast-think, deep, deep-think\n\
+Classify the request with one word.\n\
 \n\
-Tier = how much output is needed:\n\
-  instant = one sentence   |   fast = one paragraph   |   deep = multiple paragraphs\n\
+Labels:\n\
+  instant        = device commands, simple state queries, one-sentence answers\n\
+  instant-think  = instant tier but needs brief reasoning\n\
+  fast           = multi-step commands, explanations, one-paragraph answers\n\
+  fast-think     = fast tier requiring reasoning (e.g. creating an automation)\n\
+  deep           = long-form output, multi-paragraph answers\n\
+  deep-think     = deep tier requiring complex reasoning (e.g. debugging YAML)\n\
 \n\
-Add -think ONLY when the model must reason to find the correct answer.\n\
-Do NOT add -think for commands or factual responses — even if the request is ambiguous.\n\
-\n\
-  -think YES: creating automation YAML from requirements\n\
-  -think YES: debugging why an automation behaves incorrectly\n\
-  -think YES: designing or refactoring a complex automation\n\
-  -think NO: device commands (\"turn on\", \"lock\", \"set temp\", \"dim to X\")\n\
-  -think NO: state queries (\"is the door locked?\", \"what is the temperature?\")\n\
-  -think NO: ambiguous commands (model asks one clarifying question — no reasoning needed)\n\
-  -think NO: definitions or factual answers\n\
-\n\
-Examples:\n\
-  Turn on the kitchen lights                                     -> instant\n\
-  Lock the front door                                            -> instant\n\
-  Set the thermostat to 72                                       -> instant\n\
-  Dim the bedroom lights to 40% and set the AC to 68             -> instant\n\
-  Turn off the office lights and lock the front door             -> instant\n\
-  Turn on the lights                                             -> instant\n\
-  Is the garage door open?                                       -> instant\n\
-  What is the living room temperature?                           -> instant\n\
-  Are any lights on downstairs?                                  -> instant\n\
-  Create an automation to turn off lights when I leave           -> fast-think\n\
-  Turn on the porch light at sunset automation                   -> fast-think\n\
-  Why does my lights automation run twice every morning?         -> deep-think\n\
-  My away mode isn't triggering — here's the YAML               -> deep-think\n\
+Turn on the kitchen lights -> instant\n\
+Lock the front door -> instant\n\
+Set the thermostat to 72 -> instant\n\
+Is the garage door open? -> instant\n\
+What is the living room temperature? -> instant\n\
+What is the temperature outside? -> instant\n\
+Are any lights on downstairs? -> instant\n\
+Dim the bedroom lights to 40% and set the AC to 68 -> instant\n\
+Turn off the office lights and lock the front door -> instant\n\
+Create an automation to turn off lights when I leave -> fast-think\n\
+Set up a sunset porch light automation -> fast-think\n\
+Why does my lights automation run twice every morning? -> deep-think\n\
+My away mode isn't triggering, here is the YAML -> deep-think\n\
 \n\
 Reply with one word only.";
 
