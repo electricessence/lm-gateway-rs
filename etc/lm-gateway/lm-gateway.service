@@ -1,0 +1,21 @@
+[Unit]
+Description=LM Gateway RS — local LLM routing gateway
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lm-gateway
+ExecStartPost=/bin/bash -c 'curl -sf -X POST http://127.0.0.1:11434/api/chat -H "Content-Type: application/json" -d "{\"model\":\"qwen3:8b\",\"messages\":[{\"role\":\"user\",\"content\":\".\"}],\"stream\":false,\"keep_alive\":-1}" -o /dev/null 2>/dev/null &'
+Environment=LMG_CONFIG=/etc/lm-gateway/config.toml
+Environment=RUST_LOG=lm_gateway=info,tower_http=info
+EnvironmentFile=/etc/lm-gateway/env
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
