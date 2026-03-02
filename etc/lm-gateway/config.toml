@@ -1,5 +1,15 @@
-# lm-gateway configuration — 3-tier local routing
-# Routes to qwen3:1.7b / 8b / 14b via Ollama
+# lm-gateway configuration — 3-tier local routing (Haiku / Sonnet / Opus)
+# Routes to qwen3:1.7b (Q4_K_M) / 8b (Q3_K_M) / 14b (Q4_K_M) via Ollama
+#
+# Classification label ladder (Simple → Moderate → Complex):
+#   instant       qwen3:1.7b      think=false   ~300ms   greetings, trivial facts
+#   instant-think qwen3:1.7b      think=true    ~2s      trivial with mild CoT
+#   moderate      qwen3:8b-q3_K_M think=false   ~2s      general tasks, code, explains
+#   moderate-think qwen3:8b-q3_K_M think=true   ~20s+    moderate + reasoning
+#   deep          qwen3:14b       think=false   ~5s      HA commands, tool calls, complex
+#   deep-think    qwen3:14b       think=true    ~30s+    hardest problems + full CoT
+#
+# Synonym aliases (same routing): haiku=instant, sonnet=moderate, opus=deep
 
 [gateway]
 client_port          = 8080
@@ -14,11 +24,25 @@ public_profile       = "ha-auto"
 # Backend — local Ollama on the same container
 # ---------------------------------------------------------------------------
 [backends.ollama]
-provider = "ollama"
-base_url = "http://127.0.0.1:11434"
+provider    = "ollama"
+base_url    = "http://127.0.0.1:11434"
+# Allow up to 5 minutes for non-streaming calls — covers cold-start
+# (model load can take 30–90 s) and avoids the 30-second default cutoff.
+# Streaming requests use a separate no-timeout client and are unaffected.
+timeout_ms  = 300000
 
 # ---------------------------------------------------------------------------
-# Tiers — cheapest → most capable (never exposed directly to Ollama clients)
+# Tiers — ordered by cost/latency (cheapest first)
+#
+# Router index mapping (n=3):
+#   Simple   → index 0 → local:instant  (1.7b  Haiku)
+#   Moderate → index 1 → local:deep     (8b    Sonnet)
+#   Complex  → index 2 → local:opus     (14b   Opus)
+#
+# The classifier's "-think" suffix injects think=true on the elected tier:
+#   instant-think  → local:instant + think=true
+#   moderate-think → local:deep    + think=true
+#   deep-think     → local:opus    + think=true
 # ---------------------------------------------------------------------------
 [[tiers]]
 name    = "local:instant"
@@ -27,29 +51,31 @@ model   = "qwen3:1.7b"
 think   = false
 
 [[tiers]]
-name    = "local:balanced"
+name    = "local:deep"
 backend = "ollama"
-model   = "qwen3:8b"
+model   = "qwen3:8b-q3_K_M"
 think   = false
 
 [[tiers]]
-name    = "local:expert"
+name    = "local:opus"
 backend = "ollama"
 model   = "qwen3:14b"
-think   = true
+think   = false
 
 # ---------------------------------------------------------------------------
 # Aliases — map Ollama model names (as sent by clients) to gateway tiers
 # ---------------------------------------------------------------------------
 [aliases]
-# HA sends "ha-auto:latest"; route directly to qwen3:8b for reliable tool calling.
-"ha-auto:latest" = "local:balanced"
-"ha-auto"        = "local:balanced"
+# HA sends "ha-auto:latest"; entry-point alias for classify mode.
+"ha-auto:latest" = "local:instant"
+"ha-auto"        = "local:instant"
 
-# OpenAI-style aliases for Open WebUI / other clients.
-"hint:instant" = "local:instant"
-"hint:fast"    = "local:balanced"
-"hint:deep"    = "local:expert"
+# Hint aliases for Open WebUI / other clients.
+"hint:instant"       = "local:instant"
+"hint:deep"          = "local:deep"
+"hint:opus"          = "local:opus"
+"hint:deep-think"    = "local:deep"
+"hint:opus-think"    = "local:opus"
 
 # ---------------------------------------------------------------------------
 # Clients — API key → profile bindings (keys loaded from env vars)
@@ -64,13 +90,30 @@ profile = "ha-auto"
 # ---------------------------------------------------------------------------
 
 # "ha-auto:latest" — what Home Assistant sees and uses.
-# Dispatch mode: alias routes ha-auto:latest → local:balanced (qwen3:8b) directly.
-# qwen3:8b reliably executes tool calls; qwen3:1.7b does not.
-# System prompt tunes every response for HA voice/chat context.
+#
+# 2-label classify: qwen3:1.7b pre-flight routes to the right tier.
+# Default is deep (14b). Only instant (1.7b) for pure greetings/facts.
+#   deep    — device command, state query, tool call, anything home-related
+#   instant — greeting, chitchat, or pure factual question (no home action)
 [profiles.ha-auto]
-mode          = "dispatch"
-classifier    = "local:balanced"
-max_auto_tier = "local:expert"
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:opus"
+classifier_prompt = """\
+Route this Home Assistant request.
+
+DEEP — use for any of these:
+- Controls a device: light, switch, lock, thermostat, fan, cover, climate, AC, plug, media, speaker
+- Action words: turn on/off, set, dim, brighten, open, close, lock, unlock, play, pause, stop, adjust
+- Queries home state: is X on/off/open/locked/playing, what is the temperature/status
+- Departure or arrival: leaving, I'm home, goodnight, heading out
+
+INSTANT — only if:
+- Pure greeting, chitchat, joke request, or entertainment with no home action (hi, tell me a joke)
+- General knowledge question unrelated to the home (time, math, news, general facts)
+
+Reply with exactly one word: instant or deep.\
+"""
 system_prompt = """\
 You are a voice-activated assistant integrated with Home Assistant.
 
@@ -79,6 +122,10 @@ DEVICE COMMANDS (lights, locks, switches, climate, covers):
 - Use the exact device name or area name from the provided entity list. Do not invent names.
 - If the request matches multiple entities (e.g. "office lights" with two office lights), call the tool once per entity.
 - After receiving tool results, confirm briefly: "Done." or "Office lights are off."
+
+LOCK SEMANTICS:
+- "lock", "lock up", "lock the door/house" = HassTurnOn(domain=lock). Never HassTurnOff for locking.
+- "unlock" = HassTurnOff(domain=lock).
 
 STATE QUERIES ("is X on?", "what is the temperature?"):
 - Answer in one sentence using the value from the tool result.
@@ -95,27 +142,69 @@ GENERAL:
 - One sentence for simple facts.
 """
 
-# "general:latest" — generic smart router. Used by Open WebUI and other LAN clients.
+# "ha-auto:fast:latest" — same classifier, capped at 8b (local:deep).
+#
+# Trade-off: ~2s warm responses (vs ~5s on accurate) at some accuracy cost.
+# Device commands that the 14b gets right the 8b may occasionally fumble.
+# Good for users who prefer speed and are OK with occasional re-phrasing.
+[profiles."ha-auto:fast"]
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:deep"
+classifier_prompt = """\
+You route requests to a Home Assistant voice assistant.
+
+Apply rules in order:
+1. Involves any home device, appliance, lock, light, thermostat, climate, sensor, or home system → deep
+2. Checks or queries any home state, condition, or status → deep
+3. A greeting, chitchat, or purely factual question with zero home action → instant
+
+Reply with exactly one word: instant or deep.\
+"""
+system_prompt = """\
+You are a voice-activated assistant integrated with Home Assistant.
+
+DEVICE COMMANDS (lights, locks, switches, climate, covers):
+- ALWAYS call the appropriate tool. Never describe what you will do in text; just call the tool.
+- Use the exact device name or area name from the provided entity list. Do not invent names.
+- If the request matches multiple entities (e.g. "office lights" with two office lights), call the tool once per entity.
+- After receiving tool results, confirm briefly: "Done." or "Office lights are off."
+
+LOCK SEMANTICS:
+- "lock", "lock up", "lock the door/house" = HassTurnOn(domain=lock). Never HassTurnOff for locking.
+- "unlock" = HassTurnOff(domain=lock).
+
+STATE QUERIES ("is X on?", "what is the temperature?"):
+- Answer in one sentence using the value from the tool result.
+
+AUTOMATION TOGGLE (enable, disable, turn on, turn off):
+- Call the appropriate tool (automation.turn_on, automation.turn_off, or automation.toggle).
+- Confirm briefly once done.
+
+AUTOMATION CREATE / EDIT:
+- You cannot create or change automation logic through this interface.
+- Respond with one sentence: "Creating or editing automation logic requires the Home Assistant UI."
+
+GENERAL:
+- One sentence for simple facts.
+"""
+
+# "general:latest" — generic smart router for Open WebUI and other LAN clients.
 [profiles.general]
 mode              = "classify"
 classifier        = "local:instant"
-max_auto_tier     = "local:expert"
+max_auto_tier     = "local:opus"
 classifier_prompt = """\
-You are a request router. Reply with one word only.
-Labels: instant, fast, deep
+Classify this request. Reply with exactly one label.
 
-Output tier based on response length needed:
-  instant = one sentence  |  fast = one paragraph  |  deep = multiple paragraphs
+instant          — greeting, one-word fact, no reasoning needed          (1.7b)
+instant-think    — simple question with mild uncertainty                 (1.7b + CoT)
+moderate         — explanation, code, analysis (clear task)              (8b)
+moderate-think   — moderate task that benefits from step-by-step         (8b + CoT)
+deep             — complex code, architecture, detailed analysis         (14b)
+deep-think       — hardest problems, multi-step reasoning, design        (14b + CoT)
 
-Examples:
-  What is 2+2?                       -> instant
-  What does OAuth mean?              -> fast
-  Write a function to sort a list    -> fast
-  Explain how TCP/IP works           -> fast
-  Design a distributed cache system  -> deep
-  Debug this complex algorithm       -> deep
-
-Reply with one word only.
+Reply with one word only: instant, instant-think, moderate, moderate-think, deep, or deep-think.\
 """
 system_prompt = """\
 You are a concise and helpful AI assistant.
@@ -129,21 +218,16 @@ You are a concise and helpful AI assistant.
 [profiles.default]
 mode              = "classify"
 classifier        = "local:instant"
-max_auto_tier     = "local:balanced"
+max_auto_tier     = "local:opus"
 classifier_prompt = """\
-You are a request router. Reply with one word only.
-Labels: instant, fast, deep
+Classify this request. Reply with exactly one label.
 
-Output tier based on response length needed:
-  instant = one sentence  |  fast = one paragraph  |  deep = multiple paragraphs
+instant          — greeting, one-word fact, no reasoning needed          (1.7b)
+instant-think    — simple question with mild uncertainty                 (1.7b + CoT)
+moderate         — explanation, code, analysis (clear task)              (8b)
+moderate-think   — moderate task that benefits from step-by-step         (8b + CoT)
+deep             — complex code, architecture, detailed analysis         (14b)
+deep-think       — hardest problems, multi-step reasoning, design        (14b + CoT)
 
-Examples:
-  What is 2+2?                       -> instant
-  What does OAuth mean?              -> fast
-  Write a function to sort a list    -> fast
-  Explain how TCP/IP works           -> fast
-  Design a distributed cache system  -> deep
-  Debug this complex algorithm       -> deep
-
-Reply with one word only.
+Reply with one word only: instant, instant-think, moderate, moderate-think, deep, or deep-think.\
 """

@@ -201,9 +201,9 @@ fn parse_classification_label(response: &Value) -> (ClassLabel, Option<bool>) {
     };
 
     let label = match base {
-        "simple" | "1" | "easy" | "basic" | "trivial" | "low" | "instant" => ClassLabel::Simple,
-        "moderate" | "2" | "medium" | "normal" | "mid" | "fast" => ClassLabel::Moderate,
-        "complex" | "3" | "hard" | "difficult" | "expert" | "high" | "deep" => ClassLabel::Complex,
+        "simple" | "1" | "easy" | "basic" | "trivial" | "low" | "instant" | "haiku" => ClassLabel::Simple,
+        "moderate" | "2" | "medium" | "normal" | "mid" | "fast" | "think" | "sonnet" => ClassLabel::Moderate,
+        "complex" | "3" | "hard" | "difficult" | "expert" | "high" | "deep" | "opus" => ClassLabel::Complex,
         other => {
             debug!(label = other, "unrecognised classification label — defaulting to moderate");
             ClassLabel::Moderate
@@ -387,33 +387,6 @@ fn inject_system_prompt(body: &mut Value, prompt: &str) {
     messages.insert(0, serde_json::json!({ "role": "system", "content": prompt }));
 }
 
-/// Prepend a qwen3 think-control token (`/think` or `/no_think`) to the last
-/// user message in the request body.
-///
-/// qwen3 reads these tokens from the *user turn*, not the system prompt.
-/// The `/v1/chat/completions` compat endpoint ignores the `think` field, so
-/// this is the reliable cross-endpoint way to disable chain-of-thought reasoning.
-fn inject_think_token(body: &mut Value, think: bool) {
-    let token = if think { "/think" } else { "/no_think" };
-    let Some(messages) = body.pointer_mut("/messages").and_then(Value::as_array_mut) else {
-        return;
-    };
-    // Find the last user message and prepend the token.
-    if let Some(user_msg) = messages.iter_mut().rev().find(|m| {
-        m.get("role").and_then(Value::as_str) == Some("user")
-    }) {
-        let existing = user_msg
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let new_content = format!("{token}\n{existing}");
-        if let Some(obj) = user_msg.as_object_mut() {
-            obj.insert("content".into(), Value::String(new_content));
-        }
-    }
-}
-
 async fn dispatch(
     state: &RouterState,
     body: &mut Value,
@@ -437,13 +410,6 @@ async fn dispatch(
             obj.entry("think").or_insert(Value::Bool(think));
         }
     }
-    // Inject qwen3 think-control token into the last user message.
-    // The /v1/chat/completions compat endpoint silently ignores the `think` field;
-    // the token in the user turn is the reliable cross-endpoint mechanism.
-    if let Some(think) = tier.think {
-        inject_think_token(body, think);
-    }
-
     let max_retries = config.gateway.max_retries.unwrap_or(0);
     let retry_delay_ms = config.gateway.retry_delay_ms.unwrap_or(200);
 

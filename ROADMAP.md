@@ -67,6 +67,70 @@ For deterministic or near-deterministic prompts, cache the response against a ha
 
 ---
 
+## Long Range
+
+### Priority-aware request queue
+
+A per-model request queue with priority scheduling. The gateway holds back requests to avoid overloading the backend, and processes them in priority order so interactive traffic is never starved by batch work.
+
+**Core idea:** every request carries a `priority` value (integer, default `0`). Lower numbers execute first. The gateway drains all priority-0 requests before starting priority-1, and so on. Tiers can define a default priority so that classification and interactive requests naturally jump ahead of background work.
+
+**Typical priority mapping:**
+| Priority | Use case | Example |
+|----------|----------|---------|
+| `0` (default) | Classification pre-flights, instant-tier | Router classify calls, greetings |
+| `1` | Fast-tier interactive | Device commands, short explanations |
+| `2` | Deep-tier interactive | Complex analysis, code generation |
+| `3+` | Background / batch | Email classification, document labelling |
+
+**"Light" mode is just high-priority-number.** There is no separate model or CPU-only tier. A client sends a request with `priority: 3` (or uses a `light:` alias that maps to an existing tier with `default_priority = 3`). The gateway queues it behind all interactive work. The same model handles it — it just waits its turn.
+
+**Design sketch:**
+
+```toml
+# Tier-level default priority (clients can override downward but not upward)
+[[tiers]]
+name     = "local:instant"
+backend  = "ollama"
+model    = "qwen3:1.7b"
+priority = 0
+
+[[tiers]]
+name     = "local:balanced"
+backend  = "ollama"
+model    = "qwen3:4b"
+priority = 1
+
+[[tiers]]
+name     = "local:expert"
+backend  = "ollama"
+model    = "qwen3:8b"
+priority = 2
+
+# "light" alias — same model, low priority
+[aliases]
+"light:expert" = "local:expert"   # priority overridden to 3 by profile
+```
+
+Key design questions:
+- **Queue per model vs. global**: per-model queues are simpler and match Ollama's internal scheduler (which already serialises within a model). A global queue would allow cross-model priority but adds complexity.
+- **Concurrency limit**: configurable `max_concurrent` per model (default 1 for local, unlimited for cloud backends). Ollama already serialises GPU inference, so the gateway queue prevents piling up HTTP connections that would just block.
+- **Priority ceiling**: profiles can set `max_priority` to prevent clients from jumping the queue — a batch profile would have `default_priority = 3` and `max_priority = 3` (can't escalate to 0).
+- **Queue depth limit**: reject or 429 when the queue exceeds a configurable depth, so a flood of batch requests doesn't consume unbounded memory.
+- **Cloud backends skip the queue**: external backends (Anthropic, OpenRouter) have their own rate limits and don't contend for local GPU — requests to cloud tiers bypass the local queue entirely.
+- **API surface**: `priority` field in the request body (OpenAI-compat extension), or set via profile/tier defaults. No new endpoints needed.
+
+### Deeper model access
+
+Explore options for accessing more capable models within the 17.6 GiB Vulkan VRAM budget on the current hardware:
+
+- **Quantisation**: smaller quants (Q3_K_S, IQ3_XS) of larger models — e.g. qwen3:14b at IQ3_XS (~6 GiB) might fit alongside 1.7b + 4b
+- **Offloading**: partial GPU + CPU offload (`num_gpu = N` layers) for a 14b+ model — slow but functional for deep-tier requests where latency is less critical
+- **External backends**: route deep-tier to a cloud provider (Anthropic, OpenRouter) for tasks that genuinely need 70b+ capability; the gateway already supports this via backend config
+- **Hardware upgrade**: a dedicated GPU card in the Proxmox host would provide a separate VRAM pool; even a used 16 GB card would double available capacity
+
+---
+
 ## Vision
 
 lm-gateway-rs is built on a simple principle: **the deployment model should never become the problem.** One binary. One config file. Zero external state. Runs anywhere.
