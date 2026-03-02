@@ -1,4 +1,4 @@
-# lm-gateway configuration — 3-tier local classify mode
+# lm-gateway configuration — 3-tier local routing
 # Routes to qwen3:1.7b / 8b / 14b via Ollama
 
 [gateway]
@@ -39,6 +39,19 @@ model   = "qwen3:14b"
 think   = true
 
 # ---------------------------------------------------------------------------
+# Aliases — map Ollama model names (as sent by clients) to gateway tiers
+# ---------------------------------------------------------------------------
+[aliases]
+# HA sends "ha-auto:latest"; route directly to qwen3:8b for reliable tool calling.
+"ha-auto:latest" = "local:balanced"
+"ha-auto"        = "local:balanced"
+
+# OpenAI-style aliases for Open WebUI / other clients.
+"hint:instant" = "local:instant"
+"hint:fast"    = "local:balanced"
+"hint:deep"    = "local:expert"
+
+# ---------------------------------------------------------------------------
 # Clients — API key → profile bindings (keys loaded from env vars)
 # ---------------------------------------------------------------------------
 
@@ -51,11 +64,12 @@ profile = "ha-auto"
 # ---------------------------------------------------------------------------
 
 # "ha-auto:latest" — what Home Assistant sees and uses.
-# Classify mode: qwen3:1.7b labels the question, then routes to the right tier.
-# System prompt tunes every model response for HA voice/chat context.
+# Dispatch mode: alias routes ha-auto:latest → local:balanced (qwen3:8b) directly.
+# qwen3:8b reliably executes tool calls; qwen3:1.7b does not.
+# System prompt tunes every response for HA voice/chat context.
 [profiles.ha-auto]
-mode          = "classify"
-classifier    = "local:instant"
+mode          = "dispatch"
+classifier    = "local:balanced"
 max_auto_tier = "local:expert"
 system_prompt = """\
 You are a voice-activated assistant built into Home Assistant.
