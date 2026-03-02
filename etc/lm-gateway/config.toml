@@ -35,14 +35,14 @@ timeout_ms  = 300000
 # Tiers — ordered by cost/latency (cheapest first)
 #
 # Router index mapping (n=3):
-#   Simple   → index 0 → local:instant  (1.7b  Haiku)
-#   Moderate → index 1 → local:deep     (8b    Sonnet)
-#   Complex  → index 2 → local:opus     (14b   Opus)
+#   Simple   → index 0 → local:instant  (1.7b)
+#   Moderate → index 1 → local:deep     (8b)
+#   Complex  → index 2 → local:max      (14b)
 #
 # The classifier's "-think" suffix injects think=true on the elected tier:
 #   instant-think  → local:instant + think=true
 #   moderate-think → local:deep    + think=true
-#   deep-think     → local:opus    + think=true
+#   deep-think     → local:max     + think=true
 # ---------------------------------------------------------------------------
 [[tiers]]
 name    = "local:instant"
@@ -57,7 +57,7 @@ model   = "qwen3:8b-q3_K_M"
 think   = false
 
 [[tiers]]
-name    = "local:opus"
+name    = "local:max"
 backend = "ollama"
 model   = "qwen3:14b"
 think   = false
@@ -73,9 +73,9 @@ think   = false
 # Hint aliases for Open WebUI / other clients.
 "hint:instant"       = "local:instant"
 "hint:deep"          = "local:deep"
-"hint:opus"          = "local:opus"
+"hint:max"           = "local:max"
 "hint:deep-think"    = "local:deep"
-"hint:opus-think"    = "local:opus"
+"hint:max-think"     = "local:max"
 
 # ---------------------------------------------------------------------------
 # Clients — API key → profile bindings (keys loaded from env vars)
@@ -98,7 +98,7 @@ profile = "ha-auto"
 [profiles.ha-auto]
 mode              = "classify"
 classifier        = "local:instant"
-max_auto_tier     = "local:opus"
+max_auto_tier     = "local:max"
 classifier_prompt = """\
 Route this Home Assistant request.
 
@@ -117,6 +117,11 @@ Reply with exactly one word: instant or deep.\
 system_prompt = """\
 You are a voice-activated assistant integrated with Home Assistant.
 
+TOOL SCOPE:
+- Tools only act on entities explicitly listed in the provided entity context.
+- Never call a tool for something not in that list (e.g. outside weather, external services).
+- If asked about something outside the home or not in the entity list, answer from general knowledge or say you don't have that data.
+
 DEVICE COMMANDS (lights, locks, switches, climate, covers):
 - ALWAYS call the appropriate tool. Never describe what you will do in text; just call the tool.
 - Use the exact device name or area name from the provided entity list. Do not invent names.
@@ -128,6 +133,7 @@ LOCK SEMANTICS:
 - "unlock" = HassTurnOff(domain=lock).
 
 STATE QUERIES ("is X on?", "what is the temperature?"):
+- Only use tools when the queried entity is in the provided list.
 - Answer in one sentence using the value from the tool result.
 
 AUTOMATION TOGGLE (enable, disable, turn on, turn off):
@@ -164,6 +170,11 @@ Reply with exactly one word: instant or deep.\
 system_prompt = """\
 You are a voice-activated assistant integrated with Home Assistant.
 
+TOOL SCOPE:
+- Tools only act on entities explicitly listed in the provided entity context.
+- Never call a tool for something not in that list (e.g. outside weather, external services).
+- If asked about something outside the home or not in the entity list, answer from general knowledge or say you don't have that data.
+
 DEVICE COMMANDS (lights, locks, switches, climate, covers):
 - ALWAYS call the appropriate tool. Never describe what you will do in text; just call the tool.
 - Use the exact device name or area name from the provided entity list. Do not invent names.
@@ -175,6 +186,7 @@ LOCK SEMANTICS:
 - "unlock" = HassTurnOff(domain=lock).
 
 STATE QUERIES ("is X on?", "what is the temperature?"):
+- Only use tools when the queried entity is in the provided list.
 - Answer in one sentence using the value from the tool result.
 
 AUTOMATION TOGGLE (enable, disable, turn on, turn off):
@@ -193,7 +205,7 @@ GENERAL:
 [profiles.general]
 mode              = "classify"
 classifier        = "local:instant"
-max_auto_tier     = "local:opus"
+max_auto_tier     = "local:max"
 classifier_prompt = """\
 Classify this request. Reply with exactly one label.
 
@@ -218,7 +230,7 @@ You are a concise and helpful AI assistant.
 [profiles.default]
 mode              = "classify"
 classifier        = "local:instant"
-max_auto_tier     = "local:opus"
+max_auto_tier     = "local:max"
 classifier_prompt = """\
 Classify this request. Reply with exactly one label.
 
