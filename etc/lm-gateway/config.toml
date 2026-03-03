@@ -105,12 +105,15 @@ profile = "ha-auto"
 
 # "ha-auto:latest" — what Home Assistant sees and uses.
 #
-# 5-label classify: qwen3:1.7b pre-flight routes to the right tier.
-#   instant  — pure greeting/chitchat, no home action possible     (qwen3:1.7b)
-#   fast     — simple command needing entity reasoning              (qwen3:1.7b + think)
-#   moderate — single device command, clear intent, tool call       (qwen2.5:7b-instruct)
-#   deep     — state query, multi-entity, scene/routine             (qwen3:14b-q3_K_M)
-#   max      — complex scene, multi-step, or ambiguous context      (qwen3:14b-q3_K_M + think)
+# 8-label semantic classify: qwen3:1.7b pre-flight identifies intent before routing.
+#   greeting     — pure social (Hi/bye/thanks)                    → qwen3:1.7b no-think
+#   chitchat     — off-topic general knowledge or humor            → qwen3:1.7b + think
+#   vague        — action with no named device/area                → qwen3:1.7b + think
+#   command      — action targeting a named device/room/area       → qwen2.5:7b
+#   conversation — reply to a prior model question (disambiguation) → qwen2.5:7b
+#   inquiry      — state query (is X on/locked/open?)              → qwen3:14b
+#   automation   — named scene/routine/arrival trigger             → qwen3:14b
+#   other        — catch-all: unrecognised or ambiguous            → qwen3:14b
 [profiles.ha-auto]
 mode              = "classify"
 classifier        = "local:instant"
@@ -119,34 +122,42 @@ max_auto_tier     = "local:deep"
 classifier_prompt = """\
 Classify this Home Assistant voice command. Reply with ONLY: class=<label>
 
-greeting — Hi, thanks, bye, chitchat, or anything that needs no device action
-vague    — command or instruction with no clearly named device or area
-command  — action targeting a named device, room, or area
-question — state query (is X on/off/open/locked? what is the temperature?)
-complex  — scene, routine, multi-device command, or arrival/departure trigger
+greeting     — Hi, thanks, bye, how are you (pure social, no home action)
+chitchat     — joke, trivia, general knowledge question, off-topic
+vague        — action command with no clearly named device or area
+command      — action targeting a named device, room, or area
+conversation — one-word or short reply to a prior assistant question
+inquiry      — state query about a specific device or area
+automation   — arrival/departure trigger or named scene/routine
+other        — unclear, complex, or doesn't fit any category above
 
 Examples:
-  Hi                             ->  class=greeting
-  Good morning                   ->  class=greeting
-  How are you                    ->  class=greeting
-  Thank you                      ->  class=greeting
-  Tell me a joke                 ->  class=greeting
-  Turn on the light              ->  class=vague
-  Turn off the fan               ->  class=vague
-  Lock up                        ->  class=vague
-  Turn on the office light       ->  class=command
-  Turn off the kitchen light     ->  class=command
-  Lock the front door            ->  class=command
-  Set the thermostat to 72       ->  class=command
-  Dim the bedroom light to 50%   ->  class=command
-  Is the front door locked?      ->  class=question
-  Is the garage door open?       ->  class=question
-  Are all the doors locked?      ->  class=question
-  What lights are still on?      ->  class=question
-  Turn off all the lights        ->  class=complex
-  Goodnight                      ->  class=complex
-  I'm home                       ->  class=complex
-  I'm leaving                    ->  class=complex
+  Hi                               ->  class=greeting
+  Good morning                     ->  class=greeting
+  Thank you                        ->  class=greeting
+  Bye                              ->  class=greeting
+  Tell me a joke                   ->  class=chitchat
+  What's the capital of France?    ->  class=chitchat
+  Turn on the light                ->  class=vague
+  Turn off the fan                 ->  class=vague
+  Lock up                          ->  class=vague
+  Turn on the office light         ->  class=command
+  Turn off the kitchen light       ->  class=command
+  Lock the front door              ->  class=command
+  Set the thermostat to 72         ->  class=command
+  Dim the bedroom light to 50%     ->  class=command
+  Yes                              ->  class=conversation
+  No                               ->  class=conversation
+  The bedroom one                  ->  class=conversation
+  All of them                      ->  class=conversation
+  Is the front door locked?        ->  class=inquiry
+  Is the garage door open?         ->  class=inquiry
+  Are all the doors locked?        ->  class=inquiry
+  What lights are still on?        ->  class=inquiry
+  I'm home                         ->  class=automation
+  I'm leaving                      ->  class=automation
+  Goodnight                        ->  class=automation
+  Movie time                       ->  class=automation
 
 Reply with ONLY the tag. No explanation.\
 """
@@ -157,6 +168,11 @@ route_to = "local:instant"
 priority = 100
 
 [[profiles.ha-auto.rules]]
+when     = { class = "chitchat" }
+route_to = "local:fast"
+priority = 90
+
+[[profiles.ha-auto.rules]]
 when     = { class = "vague" }
 route_to = "local:fast"
 priority = 80
@@ -164,17 +180,27 @@ priority = 80
 [[profiles.ha-auto.rules]]
 when     = { class = "command" }
 route_to = "local:moderate"
+priority = 70
+
+[[profiles.ha-auto.rules]]
+when     = { class = "conversation" }
+route_to = "local:moderate"
 priority = 60
 
 [[profiles.ha-auto.rules]]
-when     = { class = "question" }
+when     = { class = "inquiry" }
+route_to = "local:deep"
+priority = 50
+
+[[profiles.ha-auto.rules]]
+when     = { class = "automation" }
 route_to = "local:deep"
 priority = 40
 
 [[profiles.ha-auto.rules]]
-when     = { class = "complex" }
+when     = { class = "other" }
 route_to = "local:deep"
-priority = 20
+priority = 10
 
 system_prompt = """\
 You are a Home Assistant voice controller. Execute commands via tools; confirm briefly.
