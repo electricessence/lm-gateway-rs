@@ -425,6 +425,13 @@ async fn dispatch(
     let mut last_err: anyhow::Error = anyhow::anyhow!("no attempts made");
     let mut delay_ms = retry_delay_ms;
 
+    // Detect tool-call requests: non-empty `tools` array in the body.
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
     for attempt in 0..=max_retries {
         if attempt > 0 {
             let sleep = std::cmp::min(delay_ms, 2_000);
@@ -439,7 +446,12 @@ async fn dispatch(
         }
 
         let t0 = std::time::Instant::now();
-        match client.chat_completions(body.clone()).await {
+        let result = if has_tools {
+            client.tool_call(body.clone()).await
+        } else {
+            client.chat_completions(body.clone()).await
+        };
+        match result {
             Ok(response) => {
                 let latency_ms = t0.elapsed().as_millis() as u64;
                 let entry = TrafficEntry::new(

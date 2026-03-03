@@ -117,6 +117,31 @@ impl OllamaAdapter {
         Ok(Box::pin(stream))
     }
 
+    /// Call Ollama's native `/api/chat` for a tool request, returning an
+    /// OpenAI-compatible non-streaming response `Value`.
+    ///
+    /// Handles both native `tool_calls` arrays and the plain-text fallback for
+    /// thinking models that emit `HassTurnOn(...)` format instead.
+    pub async fn tool_call(&self, mut body: Value) -> anyhow::Result<Value> {
+        let (message, model) = self.fetch_native_tool_response(&mut body).await?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let id = format!("chatcmpl-tools-{ts}");
+        Ok(serde_json::json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": ts,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": if message.get("tool_calls").is_some() { "tool_calls" } else { "stop" }
+            }]
+        }))
+    }
+
     /// Buffer a tool-call request via Ollama's native `/api/chat` and return a
     /// synthetic OpenAI-compatible SSE stream.
     ///
@@ -127,17 +152,47 @@ impl OllamaAdapter {
     /// re-emitted as OpenAI SSE chunks so the upstream client (e.g. HA) sees
     /// the standard OpenAI format.
     pub async fn tool_call_stream(&self, mut body: Value) -> anyhow::Result<SseStream> {
+        let (message, model) = self.fetch_native_tool_response(&mut body).await?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let id = format!("chatcmpl-tools-{ts}");
+        let finish_reason = if message.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+        let chunk1 = serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": ts, "model": model,
+            "choices": [{"index": 0, "delta": message, "finish_reason": null}]
+        });
+        let chunk2 = serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": ts, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        });
+        let parts: Vec<bytes::Bytes> = vec![
+            bytes::Bytes::from(format!("data: {}\n\n", chunk1)),
+            bytes::Bytes::from(format!("data: {}\n\n", chunk2)),
+            bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+        ];
+        Ok(Box::pin(futures_util::stream::iter(
+            parts.into_iter().map(Ok::<_, anyhow::Error>),
+        )))
+    }
+
+    /// Shared core: POST to `/api/chat` with stream=false, resolve tool calls
+    /// (native or plain-text fallback), and return an OpenAI-format message `Value`
+    /// plus the model name.
+    async fn fetch_native_tool_response(
+        &self,
+        body: &mut Value,
+    ) -> anyhow::Result<(Value, String)> {
         if let Some(obj) = body.as_object_mut() {
             obj.entry("keep_alive").or_insert(serde_json::json!(-1));
             obj.insert("stream".into(), serde_json::json!(false));
         }
-
         let model = body
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-
         let url = format!("{}/api/chat", self.base_url);
         let response = self
             .stream_client
@@ -146,47 +201,28 @@ impl OllamaAdapter {
             .send()
             .await
             .with_context(|| format!("POST {url} (tool call)"))?;
-
         let status = response.status();
         let text = response.text().await.context("reading Ollama native tool response")?;
-
         if !status.is_success() {
             anyhow::bail!("Ollama returned HTTP {status}: {text}");
         }
-
         let native: Value = serde_json::from_str(&text)
             .with_context(|| format!("parsing Ollama native tool response: {text}"))?;
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let id = format!("chatcmpl-tools-{ts}");
-
-        let message = native.pointer("/message").cloned().unwrap_or(Value::Null);
-        let tool_calls = message.get("tool_calls").and_then(Value::as_array).cloned();
-        let content = message
+        let native_msg = native.pointer("/message").cloned().unwrap_or(Value::Null);
+        let tool_calls = native_msg.get("tool_calls").and_then(Value::as_array).cloned();
+        let content = native_msg
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-
-        // When thinking models emit tool calls as plain text (e.g. `HassTurnOn(area="x", domain="y")`)
-        // instead of a structured tool_calls array, parse and convert them.
-        let resolved_tool_calls = tool_calls.or_else(|| Self::parse_plain_text_tool_calls(&content));
-
-        let (delta_first, finish_reason) = if let Some(tc) = resolved_tool_calls {
-            // Convert Ollama native tool_calls → OpenAI format.
+        let resolved = tool_calls.or_else(|| Self::parse_plain_text_tool_calls(&content));
+        let message = if let Some(tc) = resolved {
             let openai_calls: Vec<Value> = tc
                 .iter()
                 .enumerate()
                 .map(|(i, call)| {
                     let func = call.get("function").cloned().unwrap_or(Value::Null);
-                    let name = func
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
+                    let name = func.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
                     let args = func.get("arguments").cloned().unwrap_or(Value::Null);
                     let args_str = serde_json::to_string(&args).unwrap_or_default();
                     serde_json::json!({
@@ -197,39 +233,11 @@ impl OllamaAdapter {
                     })
                 })
                 .collect();
-            (
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": openai_calls
-                }),
-                "tool_calls",
-            )
+            serde_json::json!({ "role": "assistant", "content": null, "tool_calls": openai_calls })
         } else {
-            (
-                serde_json::json!({ "role": "assistant", "content": content }),
-                "stop",
-            )
+            serde_json::json!({ "role": "assistant", "content": content })
         };
-
-        let chunk1 = serde_json::json!({
-            "id": id, "object": "chat.completion.chunk", "created": ts, "model": model,
-            "choices": [{"index": 0, "delta": delta_first, "finish_reason": null}]
-        });
-        let chunk2 = serde_json::json!({
-            "id": id, "object": "chat.completion.chunk", "created": ts, "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-        });
-
-        let parts: Vec<bytes::Bytes> = vec![
-            bytes::Bytes::from(format!("data: {}\n\n", chunk1)),
-            bytes::Bytes::from(format!("data: {}\n\n", chunk2)),
-            bytes::Bytes::from_static(b"data: [DONE]\n\n"),
-        ];
-
-        Ok(Box::pin(futures_util::stream::iter(
-            parts.into_iter().map(Ok::<_, anyhow::Error>),
-        )))
+        Ok((message, model))
     }
 
 /// Parse Python-style plain-text tool calls emitted by thinking models when

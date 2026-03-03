@@ -117,6 +117,20 @@ impl BackendClient {
         }
     }
 
+    /// Send a non-streaming tool-call request and return an OpenAI-compatible
+    /// response `Value`.
+    ///
+    /// For Ollama, routes through the native `/api/chat` endpoint, bypassing
+    /// Ollama's broken compat-layer tool-call translation, and applies the
+    /// plain-text fallback parser for thinking models.  All other backends fall
+    /// back to the standard `/v1/chat/completions` path.
+    pub async fn tool_call(&self, request: Value) -> anyhow::Result<Value> {
+        match self {
+            Self::Ollama(a) => a.tool_call(request).await,
+            _ => self.chat_completions(request).await,
+        }
+    }
+
     /// Send a tool-call request and return an OpenAI-compatible SSE stream.
     ///
     /// For Ollama, routes through the native `/api/chat` endpoint and converts
