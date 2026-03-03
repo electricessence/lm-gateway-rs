@@ -105,14 +105,12 @@ profile = "ha-auto"
 
 # "ha-auto:latest" — what Home Assistant sees and uses.
 #
-# 8-label semantic classify: qwen3:1.7b pre-flight identifies intent before routing.
-#   greeting     — pure social (Hi/bye/thanks)                    → qwen3:1.7b no-think
+# 6-label semantic classify: qwen3:1.7b pre-flight identifies intent before routing.
+#   greeting     — pure social (Hi/bye/thanks/Goodnight)          → qwen3:1.7b no-think
 #   chitchat     — off-topic general knowledge or humor            → qwen3:1.7b + think
-#   vague        — action with no named device/area                → qwen3:1.7b + think
-#   command      — action targeting a named device/room/area       → qwen2.5:7b
+#   command      — any action request (named or unnamed target)    → qwen2.5:7b
 #   conversation — reply to a prior model question (disambiguation) → qwen2.5:7b
 #   inquiry      — state query (is X on/locked/open?)              → qwen3:14b
-#   automation   — named scene/routine/arrival trigger             → qwen3:14b
 #   other        — catch-all: unrecognised or ambiguous            → qwen3:14b
 [profiles.ha-auto]
 mode              = "classify"
@@ -122,13 +120,11 @@ max_auto_tier     = "local:deep"
 classifier_prompt = """\
 Classify this Home Assistant voice command. Reply with ONLY: class=<label>
 
-greeting     — Hi, thanks, bye, how are you (pure social, no home action)
+greeting     — Hi, thanks, bye, good morning/evening/night (social, no home action)
 chitchat     — joke, trivia, general knowledge question, off-topic
-vague        — action command with no clearly named device or area
-command      — action targeting a named device, room, or area
+command      — any action request, with or without a named device or area
 conversation — one-word or short reply to a prior assistant question
 inquiry      — state query about a specific device or area
-automation   — arrival/departure trigger or named scene/routine
 other        — unclear, complex, or doesn't fit any category above
 
 Examples:
@@ -136,11 +132,13 @@ Examples:
   Good morning                     ->  class=greeting
   Thank you                        ->  class=greeting
   Bye                              ->  class=greeting
+  Goodnight                        ->  class=greeting
+  Good evening                     ->  class=greeting
   Tell me a joke                   ->  class=chitchat
   What's the capital of France?    ->  class=chitchat
-  Turn on the light                ->  class=vague
-  Turn off the fan                 ->  class=vague
-  Lock up                          ->  class=vague
+  Turn on the light                ->  class=command
+  Turn off the fan                 ->  class=command
+  Lock up                          ->  class=command
   Turn on the office light         ->  class=command
   Turn off the kitchen light       ->  class=command
   Lock the front door              ->  class=command
@@ -154,10 +152,6 @@ Examples:
   Is the garage door open?         ->  class=inquiry
   Are all the doors locked?        ->  class=inquiry
   What lights are still on?        ->  class=inquiry
-  I'm home                         ->  class=automation
-  I'm leaving                      ->  class=automation
-  Goodnight                        ->  class=automation
-  Movie time                       ->  class=automation
 
 Reply with ONLY the tag. No explanation.\
 """
@@ -173,11 +167,6 @@ route_to = "local:fast"
 priority = 90
 
 [[profiles.ha-auto.rules]]
-when     = { class = "vague" }
-route_to = "local:fast"
-priority = 80
-
-[[profiles.ha-auto.rules]]
 when     = { class = "command" }
 route_to = "local:moderate"
 priority = 70
@@ -191,11 +180,6 @@ priority = 60
 when     = { class = "inquiry" }
 route_to = "local:deep"
 priority = 50
-
-[[profiles.ha-auto.rules]]
-when     = { class = "automation" }
-route_to = "local:deep"
-priority = 40
 
 [[profiles.ha-auto.rules]]
 when     = { class = "other" }

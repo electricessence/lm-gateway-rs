@@ -46,25 +46,22 @@ function Show-Row([string]$Profile, [string]$Q, [string]$Expect, [string]$Class)
 }
 
 Write-Host ''
-Write-Host '=== ha-auto — 8-label classifier ===' -ForegroundColor Cyan
+Write-Host '=== ha-auto — 6-label classifier ===' -ForegroundColor Cyan
 Write-Host ('{0,-4} {1,7}   {2,-12} {3,-12} [{4,-12}] {5}' -f 'RSLT', 'ms', 'got', 'expected', 'class', 'prompt')
 Write-Host ('-' * 90)
 
-# greeting → instant
+# greeting → instant (pure social, incl. time-of-day greetings)
 Show-Row 'ha-auto:latest' 'Hey, good morning'             'instant/fast' 'greeting'
-Show-Row 'ha-auto:latest' 'Thank you'                     'instant/fast' 'greeting'
+Show-Row 'ha-auto:latest' 'Goodnight'                     'instant/fast' 'greeting'
 
 # chitchat → fast (1.7b + think)
 Show-Row 'ha-auto:latest' 'Tell me a joke'                'instant/fast' 'chitchat'
 Show-Row 'ha-auto:latest' "What's the capital of France?" 'instant/fast' 'chitchat'
 
-# vague → fast
-Show-Row 'ha-auto:latest' 'Turn on the light'             'instant/fast' 'vague'
-Show-Row 'ha-auto:latest' 'Lock up'                       'instant/fast' 'vague'
-
-# command → moderate
+# command → moderate (vague OR specific — all actions go here)
+Show-Row 'ha-auto:latest' 'Turn on the light'             'moderate'     'command'
+Show-Row 'ha-auto:latest' 'Lock up'                       'moderate'     'command'
 Show-Row 'ha-auto:latest' 'Lock the front door'           'moderate'     'command'
-Show-Row 'ha-auto:latest' 'Turn off the kitchen light'    'moderate'     'command'
 Show-Row 'ha-auto:latest' 'Set the thermostat to 72'      'moderate'     'command'
 
 # conversation → moderate
@@ -75,10 +72,6 @@ Show-Row 'ha-auto:latest' 'The bedroom one'               'moderate'     'conver
 Show-Row 'ha-auto:latest' 'Is the garage door open?'      'deep/max'     'inquiry'
 Show-Row 'ha-auto:latest' 'Are all the doors locked?'     'deep/max'     'inquiry'
 Show-Row 'ha-auto:latest' 'What lights are still on?'     'deep/max'     'inquiry'
-
-# automation → deep
-Show-Row 'ha-auto:latest' "I'm home"                      'deep/max'     'automation'
-Show-Row 'ha-auto:latest' 'Goodnight'                     'deep/max'     'automation'
 
 Write-Host ('-' * 90)
 Write-Host ''
