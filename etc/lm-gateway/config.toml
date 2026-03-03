@@ -1,11 +1,11 @@
 # lm-gateway configuration — 3-tier local routing
-# Routes to qwen3:1.7b (Q4_K_M) / qwen2.5:7b-instruct (Q3_K_M+tools) / qwen3:14b (Q4_K_M) via Ollama
+# Routes to qwen3:1.7b (Q4_K_M) / qwen2.5:7b-instruct (Q4_K_M) / qwen3:14b (Q4_K_M) via Ollama
 #
 # Classification label ladder (lightest → heaviest):
 #   instant          qwen3:1.7b                 think=false   ~300ms   greetings, trivial facts
 #   instant-think    qwen3:1.7b                 think=true    ~2s      trivial with mild CoT
-#   moderate         qwen2.5:7b-instruct-q3_K_M think=false   ~2s      device cmds, code, daily tasks (tools OK)
-#   moderate-think   qwen2.5:7b-instruct-q3_K_M think=true    ~15s+    moderate + step-by-step reasoning
+#   moderate         qwen2.5:7b-instruct        think=false   ~2s      device cmds, code, daily tasks (tools OK)
+#   moderate-think   qwen2.5:7b-instruct        think=true    ~15s+    moderate + step-by-step reasoning
 #   deep             qwen3:14b                  think=false   ~5s      complex queries, multi-entity, synthesis
 #   deep-think       qwen3:14b                  think=true    ~30s+    hardest problems + full CoT
 
@@ -51,7 +51,7 @@ think   = false
 [[tiers]]
 name    = "local:moderate"
 backend = "ollama"
-model   = "qwen2.5:7b-instruct-q3_K_M"
+model   = "qwen2.5:7b-instruct"
 think   = false
 
 [[tiers]]
