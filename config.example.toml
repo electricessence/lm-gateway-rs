@@ -61,17 +61,17 @@ backend = "ollama"
 model   = "qwen2.5:1.5b"
 
 [[tiers]]
-name    = "local:capable"
+name    = "local:deep"
 backend = "ollama"
 model   = "qwen2.5:7b"
 
 [[tiers]]
-name    = "cloud:economy"
+name    = "cloud:fast"
 backend = "openrouter"
 model   = "anthropic/claude-haiku-4-5"
 
 [[tiers]]
-name    = "cloud:standard"
+name    = "cloud:deep"
 backend = "openrouter"
 model   = "anthropic/claude-sonnet-4-5"
 
@@ -87,9 +87,9 @@ model   = "anthropic/claude-opus-4-5"
 [aliases]
 "hint:fast"     = "local:fast"
 "hint:cheap"    = "local:fast"
-"hint:local"    = "local:capable"
-"hint:cloud"    = "cloud:economy"
-"hint:standard" = "cloud:standard"
+"hint:local"    = "local:deep"
+"hint:cloud"    = "cloud:fast"
+"hint:standard" = "cloud:deep"
 "hint:expert"   = "cloud:expert"
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ model   = "anthropic/claude-opus-4-5"
 [profiles.default]
 mode               = "dispatch"       # "dispatch" | "escalate" | "classify"
 classifier         = "local:fast"     # tier used for intent classification (dispatch mode)
-max_auto_tier      = "cloud:economy"  # ceiling before expert_requires_flag kicks in
+max_auto_tier      = "cloud:fast"     # ceiling before expert_requires_flag kicks in
 expert_requires_flag = true           # client must set X-Claw-Expert: true to reach expert tier
 # rate_limit_rpm = 120               # total RPM shared by ALL clients on this profile
 
@@ -107,15 +107,16 @@ expert_requires_flag = true           # client must set X-Claw-Expert: true to r
 [profiles.escalating]
 mode               = "escalate"
 classifier         = "local:fast"
-max_auto_tier      = "cloud:standard"
+max_auto_tier      = "cloud:deep"
 expert_requires_flag = true
 # rate_limit_rpm = 60                # tighter quota for escalating (more expensive) callers
 
-# Classify profile — uses a fast model to label complexity before dispatching.
-# A single non-streaming call to `classifier` emits "instant", "fast", or
-# "deep"; that label maps to tiers[0], tiers[n/2], or tiers[n-1] respectively.
-# (Legacy labels "simple"/"moderate"/"complex" are also accepted for backwards compat.)
-# Ideal for local-only deployments where every byte saved matters.
+# Classify profile — uses a fast model to label request complexity, then dispatches
+# to the matching tier. The classifier returns one of: instant, instant-think,
+# fast, fast-think, deep, deep-think. Each label is matched against tier names
+# by suffix (e.g. "fast" → first tier whose name ends with "fast") with a middle-
+# tier fallback for unknown labels. Tier names ending in the label word are the
+# recommended convention — see the local-only example at the bottom of this file.
 #
 # Ollama-compatibility endpoints expose PROFILE NAMES as models, not raw tiers:
 #   GET  /api/tags      — returns {"models": [{"name":"auto:latest"}, ...]}
@@ -125,8 +126,8 @@ expert_requires_flag = true
 [profiles.auto]
 mode               = "classify"
 classifier         = "local:fast"   # tier used for the pre-flight classification call
-max_auto_tier      = "cloud:expert" # ceiling tier (tiers[n-1]); remove to cap at mid
-# classifier_prompt = "..."         # override the built-in classification prompt (v11, 94% accuracy)
+max_auto_tier      = "cloud:expert" # ceiling tier; exclude cloud:expert to cap at cloud:deep
+# classifier_prompt = "..."         # override the built-in classification prompt (v16, 27/27 on 27-case HA benchmark)
 # system_prompt     = "..."         # prepended to every request forwarded through this profile
 
 # Home Assistant smart-routing profile.
@@ -136,7 +137,7 @@ max_auto_tier      = "cloud:expert" # ceiling tier (tiers[n-1]); remove to cap a
 [profiles.ha-auto]
 mode           = "classify"
 classifier     = "local:fast"
-max_auto_tier  = "cloud:expert"
+max_auto_tier  = "cloud:deep"   # override to cloud:expert if you want opus; keep deep for cost control
 system_prompt  = """
 You are an AI assistant integrated with Home Assistant (HA), an open-source home automation platform.
 Help the user with smart home queries, configuration, automations, and troubleshooting.
