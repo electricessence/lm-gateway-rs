@@ -59,6 +59,20 @@ Never exceed 2 parallel Cargo jobs in Docker. The host has limited RAM.
 
 ---
 
+## Script Library — Reusable `.ps1` Tools
+
+**Always create named `.ps1` scripts** for repeatable operations — never leave work as ad-hoc terminal commands. Scripts are **self-documenting**: they capture not just what ran but why, with parameters, comments, and structure that makes patterns reusable and auditable by any agent or operator.
+
+- **Naming**: `Verb-Noun.ps1` (PowerShell convention). E.g. `Deploy-GatewayConfig.ps1`, `Test-HaPrompts.ps1`.
+- **Location**: `tools/<scope>/` for persistent scripts. Temporary/one-off scripts go in `tools/temp/MMDD/description.ps1` (e.g. `tools/temp/0710/debug-gateway.ps1`) — subfolder per day, auditable, obviously ephemeral.
+- **Structure**: `#Requires -Version 7`, `[CmdletBinding()]`, comment-based help, `param()` block, `$ErrorActionPreference = 'Stop'`.
+- **Fully parameterized**: Every environment-specific value (SSH alias, LXC ID, ports, model names) must be a parameter with a sensible default. Scripts should work for different people and environments.
+- **No hardcoded secrets**: Credentials and connection details come from parameters or environment variables.
+
+Full PowerShell quality standards → `.github/instructions/powershell.instructions.md`
+
+---
+
 ## Commit & Push Procedure
 
 See `.github/instructions/phased-commit.instructions.md` for the full procedure.

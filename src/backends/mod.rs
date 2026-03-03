@@ -98,6 +98,68 @@ impl BackendClient {
         }
     }
 
+    /// Stream via the backend's native endpoint when available.
+    ///
+    /// For Ollama this uses `/api/chat` which honours Ollama-specific fields
+    /// such as `think: false`. Returns `(stream, is_native_ndjson)` where
+    /// `is_native_ndjson == true` means the bytes are already Ollama NDJSON
+    /// and should be proxied directly without SSE→NDJSON conversion.
+    ///
+    /// All other backends fall back to [`chat_completions_stream`] (SSE) and
+    /// return `false`.
+    pub async fn native_chat_stream(
+        &self,
+        request: Value,
+    ) -> anyhow::Result<(SseStream, bool)> {
+        match self {
+            Self::Ollama(a) => Ok((a.native_chat_stream(request).await?, true)),
+            _ => Ok((self.chat_completions_stream(request).await?, false)),
+        }
+    }
+
+    /// Send a non-streaming tool-call request and return an OpenAI-compatible
+    /// response `Value`.
+    ///
+    /// For Ollama, routes through the native `/api/chat` endpoint, bypassing
+    /// Ollama's broken compat-layer tool-call translation, and applies the
+    /// plain-text fallback parser for thinking models.  All other backends fall
+    /// back to the standard `/v1/chat/completions` path.
+    pub async fn tool_call(&self, request: Value) -> anyhow::Result<Value> {
+        match self {
+            Self::Ollama(a) => a.tool_call(request).await,
+            _ => self.chat_completions(request).await,
+        }
+    }
+
+    /// Send a tool-call request and return an OpenAI-compatible SSE stream.
+    ///
+    /// For Ollama, routes through the native `/api/chat` endpoint and converts
+    /// the response to a synthetic OpenAI SSE stream, bypassing Ollama's broken
+    /// compat-layer tool-call translation.  All other backends pass through to
+    /// [`chat_completions_stream`] unchanged — they handle tool calls correctly
+    /// via their OpenAI-compat endpoints.
+    pub async fn tool_call_stream(
+        &self,
+        request: Value,
+    ) -> anyhow::Result<(SseStream, bool)> {
+        match self {
+            Self::Ollama(a) => Ok((a.tool_call_stream(request).await?, false)),
+            _ => Ok((self.chat_completions_stream(request).await?, false)),
+        }
+    }
+
+    /// Send a classification request to the backend.
+    ///
+    /// For Ollama backends this routes to the native `/api/chat` endpoint so
+    /// that Ollama-specific request fields (e.g. `think`) are honoured.
+    /// Other backends fall back to the standard `/v1/chat/completions` path.
+    pub async fn classify(&self, request: Value) -> anyhow::Result<Value> {
+        match self {
+            Self::Ollama(a) => a.classify(request).await,
+            _ => self.chat_completions(request).await,
+        }
+    }
+
     /// Probe this backend for liveness. Implementation varies by provider.
     pub async fn health_check(&self) -> anyhow::Result<()> {
         match self {

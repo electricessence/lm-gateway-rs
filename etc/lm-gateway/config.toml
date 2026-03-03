@@ -1,0 +1,263 @@
+# lm-gateway configuration — 5-tier local routing
+# Routes to qwen3:1.7b / qwen2.5:7b-instruct / qwen3:14b-q3_K_M via Ollama
+#
+# Classification label ladder (lightest → heaviest):
+#   instant    qwen3:1.7b              think=false   ~300ms   greetings, pure chitchat
+#   fast       qwen3:1.7b              think=true    ~2-4s    simple device cmd needing CoT
+#   moderate   qwen2.5:7b-instruct     think=false   ~2s      single device cmd, clean tool calls
+#   deep       qwen3:14b-q3_K_M        think=false   ~5s      state queries, multi-entity, scenes
+#   max        qwen3:14b-q3_K_M        think=true    ~30s+    hardest problems + full CoT
+
+[gateway]
+client_port          = 8080
+admin_port           = 8081
+traffic_log_capacity = 500
+log_level            = "info"
+admin_token_env      = "LMG_ADMIN_TOKEN"
+# Unauthenticated LAN requests fall through to this profile instead of 401.
+public_profile       = "ha-auto"
+
+# ---------------------------------------------------------------------------
+# Backend — local Ollama on the same container
+# ---------------------------------------------------------------------------
+[backends.ollama]
+provider    = "ollama"
+base_url    = "http://127.0.0.1:11434"
+# Allow up to 5 minutes for non-streaming calls — covers cold-start
+# (model load can take 30–90 s) and avoids the 30-second default cutoff.
+# Streaming requests use a separate no-timeout client and are unaffected.
+timeout_ms  = 300000
+
+# ---------------------------------------------------------------------------
+# Tiers — ordered by cost/latency (cheapest first)
+#
+# Router index mapping (n=5):
+#   instant  → index 0 → local:instant   (qwen3:1.7b)
+#   fast     → index 1 → local:fast      (qwen3:1.7b + think)
+#   moderate → index 2 → local:moderate  (qwen2.5:7b-instruct)
+#   deep     → index 3 → local:deep      (qwen3:14b-q3_K_M)
+#   max      → index 4 → local:max       (qwen3:14b-q3_K_M + think)
+#
+# The classifier's "-think" suffix injects think=true on the elected tier.
+# ---------------------------------------------------------------------------
+[[tiers]]
+name    = "local:instant"
+backend = "ollama"
+model   = "qwen3:1.7b"
+think   = false
+
+[[tiers]]
+name    = "local:fast"
+backend = "ollama"
+model   = "qwen3:1.7b"
+think   = true
+
+[[tiers]]
+name    = "local:moderate"
+backend = "ollama"
+model   = "qwen2.5:7b-instruct"
+think   = false
+
+[[tiers]]
+name    = "local:deep"
+backend = "ollama"
+model   = "qwen3:14b-q3_K_M"
+think   = false
+
+[[tiers]]
+name    = "local:max"
+backend = "ollama"
+model   = "qwen3:14b-q3_K_M"
+think   = true
+
+# ---------------------------------------------------------------------------
+# Aliases — map Ollama model names (as sent by clients) to gateway tiers
+# ---------------------------------------------------------------------------
+[aliases]
+# HA sends "ha-auto:latest"; entry-point alias for classify mode.
+"ha-auto:latest" = "local:instant"
+"ha-auto"        = "local:instant"
+
+# Hint aliases for Open WebUI / other clients.
+"hint:instant"   = "local:instant"
+"hint:fast"      = "local:fast"
+"hint:moderate"  = "local:moderate"
+"hint:deep"      = "local:deep"
+"hint:max"       = "local:max"
+
+# ---------------------------------------------------------------------------
+# Clients — API key → profile bindings (keys loaded from env vars)
+# ---------------------------------------------------------------------------
+
+[[clients]]
+key_env = "LMG_HA_KEY"
+profile = "ha-auto"
+
+# ---------------------------------------------------------------------------
+# Profiles — these are the "models" Ollama clients see in /api/tags
+# ---------------------------------------------------------------------------
+
+# "ha-auto:latest" — what Home Assistant sees and uses.
+#
+# 5-label classify: qwen3:1.7b pre-flight routes to the right tier.
+#   instant  — pure greeting/chitchat, no home action possible     (qwen3:1.7b)
+#   fast     — simple command needing entity reasoning              (qwen3:1.7b + think)
+#   moderate — single device command, clear intent, tool call       (qwen2.5:7b-instruct)
+#   deep     — state query, multi-entity, scene/routine             (qwen3:14b-q3_K_M)
+#   max      — complex scene, multi-step, or ambiguous context      (qwen3:14b-q3_K_M + think)
+[profiles.ha-auto]
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:deep"
+classifier_prompt = """\
+Route this Home Assistant voice request. Reply with one word only.
+
+  instant  — greeting or chitchat with no possible home action
+  fast     — simple device command where the entity needs reasoning
+  moderate — single device command with a clearly named entity
+  deep     — state query, multi-room, multi-device, or scene trigger
+
+  Hi                                                       -> instant
+  How are you                                              -> instant
+  Good morning                                             -> instant
+  Tell me a joke                                           -> instant
+  Turn on the office light                                 -> moderate
+  Lock the front door                                      -> moderate
+  Turn off the TV                                          -> moderate
+  Set the thermostat to 72                                 -> moderate
+  Turn on the light in my office                           -> fast
+  Lock up                                                  -> fast
+  Turn off all the lights                                  -> deep
+  What is the living room temperature?                     -> deep
+  Are any lights on downstairs?                            -> deep
+  Is the garage door open?                                 -> deep
+  Goodnight                                                -> deep
+  I'm home                                                 -> deep
+  I'm leaving                                              -> deep
+
+Reply with one word only: instant, fast, moderate, or deep.\
+"""
+system_prompt = """\
+You are a voice-activated Home Assistant controller.
+
+TOOL USE:
+- Call a tool immediately and directly when the user requests a home action.
+- Choose the entity whose name most closely matches what the user said, using only names present in the provided entity list.
+- When multiple entities match (e.g. two office lights), call the tool once per matching entity.
+- Respond with a brief confirmation after tool results arrive: "Done." or "Office lights are off."
+- For requests about things outside the entity list (weather, external services), answer from general knowledge in one sentence.
+
+ENTITY NAMES:
+- Copy the entity name exactly as it appears in the provided list — spelling, capitalisation, and all.
+- When the user's wording is ambiguous, pick the closest match from the list and act on it.
+- When no entity is a reasonable match, ask the user to clarify with one short question.
+
+LOCKS:
+- "lock" / "lock up" / "lock the door" = HassTurnOn(domain=lock).
+- "unlock" = HassTurnOff(domain=lock).
+
+STATE QUERIES:
+- Call the relevant tool, then answer in one sentence using the value returned.
+
+AUTOMATIONS:
+- Toggle with the appropriate tool and confirm briefly.
+- Creating or editing automation logic requires the Home Assistant UI — say so in one sentence.
+
+GENERAL:
+- One sentence for facts and confirmations.
+"""
+
+# "ha-auto:fast:latest" — same classifier, capped at local:moderate (qwen2.5:7b).
+#
+# Trade-off: ~2s warm responses at some accuracy cost vs ha-auto.
+[profiles."ha-auto:fast"]
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:moderate"
+classifier_prompt = """\
+Route this Home Assistant voice request. Reply with one word only.
+
+  instant  — greeting or chitchat with no possible home action
+  fast     — simple device command where the entity needs reasoning
+  moderate — single device command with a clearly named entity
+
+  Hi                                                       -> instant
+  Good morning                                             -> instant
+  Turn on the office light                                 -> moderate
+  Lock the front door                                      -> moderate
+  Turn on the light in my office                           -> fast
+  Lock up                                                  -> fast
+  Is the garage door open?                                 -> moderate
+
+Reply with one word only: instant, fast, or moderate.\
+"""
+system_prompt = """\
+You are a voice-activated Home Assistant controller.
+
+TOOL USE:
+- Call a tool immediately and directly when the user requests a home action.
+- Choose the entity whose name most closely matches what the user said, using only names present in the provided entity list.
+- When multiple entities match (e.g. two office lights), call the tool once per matching entity.
+- Respond with a brief confirmation after tool results arrive: "Done." or "Office lights are off."
+- For requests about things outside the entity list (weather, external services), answer from general knowledge in one sentence.
+
+ENTITY NAMES:
+- Copy the entity name exactly as it appears in the provided list — spelling, capitalisation, and all.
+- When the user's wording is ambiguous, pick the closest match from the list and act on it.
+- When no entity is a reasonable match, ask the user to clarify with one short question.
+
+LOCKS:
+- "lock" / "lock up" / "lock the door" = HassTurnOn(domain=lock).
+- "unlock" = HassTurnOff(domain=lock).
+
+STATE QUERIES:
+- Call the relevant tool, then answer in one sentence using the value returned.
+
+AUTOMATIONS:
+- Toggle with the appropriate tool and confirm briefly.
+- Creating or editing automation logic requires the Home Assistant UI — say so in one sentence.
+
+GENERAL:
+- One sentence for facts and confirmations.
+"""
+
+# "general:latest" — generic smart router for Open WebUI and other LAN clients.
+[profiles.general]
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:max"
+classifier_prompt = """\
+Classify this request. Reply with exactly one label.
+
+instant    — greeting, one-word fact, no reasoning needed          (1.7b)
+fast       — simple question with mild uncertainty                 (1.7b + CoT)
+moderate   — explanation, code, analysis, device commands          (7b)
+deep       — complex code, architecture, detailed analysis         (14b)
+max        — hardest problems, multi-step reasoning, design        (14b + CoT)
+
+Reply with one word only: instant, fast, moderate, deep, or max.\
+"""
+system_prompt = """\
+You are a concise and helpful AI assistant.
+- Answer directly without unnecessary preamble or apologies.
+- For code: add brief comments; use idiomatic style for the language.
+- For explanations: match depth to complexity — one sentence for facts, structured detail for concepts.
+- For design and architecture: give concrete recommendations with trade-offs.
+"""
+
+# "default" profile — fallback for unauthenticated /v1/chat/completions requests.
+[profiles.default]
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:max"
+classifier_prompt = """\
+Classify this request. Reply with exactly one label.
+
+instant    — greeting, one-word fact, no reasoning needed          (1.7b)
+fast       — simple question with mild uncertainty                 (1.7b + CoT)
+moderate   — explanation, code, analysis, device commands          (7b)
+deep       — complex code, architecture, detailed analysis         (14b)
+max        — hardest problems, multi-step reasoning, design        (14b + CoT)
+
+Reply with one word only: instant, fast, moderate, deep, or max.\
+"""

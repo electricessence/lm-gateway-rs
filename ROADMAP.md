@@ -44,6 +44,79 @@ A lightweight, single-binary LLM routing gateway in Rust. No Python. No database
 
 > Targeted next
 
+### Semantic tagging — multi-label classification and rule-based routing
+
+The current classifier emits a single routing label (`fast`, `deep`, etc.). A structured multi-tag output from the same classifier call unlocks a lightweight rules engine that can route on semantic intent rather than model difficulty alone.
+
+**How it works (single LLM call):**
+
+The classifier prompt is extended to produce `key=value` pairs alongside — or instead of — the bare tier label:
+
+```
+tier=fast intent=greeting
+tier=fast intent=command domain=home
+tier=deep intent=question domain=security complexity=hard
+```
+
+**Profile config adds a `rules` table (first-match wins, priority desc):**
+
+```toml
+[[profiles.default.rules]]
+when     = { intent = "greeting" }
+route_to = "local:fast"
+priority = 30
+
+[[profiles.default.rules]]
+when     = { intent = "command", domain = "home" }
+route_to = "local:fast"
+priority = 20
+
+[[profiles.default.rules]]
+when     = { domain = "security" }
+route_to = "cloud:deep"
+priority = 10
+
+# No rule matched → fall through to normal tier-label routing
+```
+
+**Design principles:**
+
+- Tag keys and values are **user-defined** — the gateway matches strings, not a fixed schema. You design the taxonomy; the gateway evaluates it.
+- `conf.d/` overlays let you add or override rules per deployment without touching the base config.
+- Rules are a pre-pass: if a rule matches, the request is dispatched immediately and the normal difficulty-tier routing is skipped.
+- The existing label output (`tier=fast`) is still honoured as fallback when no rules match.
+- Backward-compatible: when no `rules` are configured, behaviour is identical to today.
+
+**What changes in code (~200 lines new Rust):**
+
+- `config/profile.rs`: add `RuleConfig { when: HashMap<String, String>, route_to: String, priority: i32 }` + `rules: Vec<RuleConfig>` on `ProfileConfig`
+- `router/classify.rs`: extend `parse_classification_label` to extract `key=value` tags alongside the tier label
+- `router/modes.rs`: rule-evaluation loop before tier dispatch in `classify_and_dispatch`
+
+**Typical tag schemas:**
+
+| Schema | Tags |
+|--------|------|
+| Home Assistant | `intent=command\|question\|status_query`, `domain=home\|sensor\|security\|general` |
+| Generic assistant | `intent=greeting\|task\|fact\|code`, `complexity=trivial\|normal\|hard` |
+| Custom | Anything — you define it in the classifier prompt |
+
+**Classifier fallback (fits here naturally):**
+
+When the classifier call fails outright (network error, timeout) or returns unusable output, fall back to a more reliable classifier tier rather than aborting or silently routing to the wrong place:
+
+```toml
+[profiles.default]
+classifier          = "local:instant"  # try this first (fastest, cheapest)
+classifier_fallback = "local:fast"     # retry with this on failure / empty output
+```
+
+On failure, fire once against `classifier_fallback`, parse the tags, then proceed normally. Zero extra latency on the happy path.
+
+Note: the classifier is always a local model — its purpose is to avoid unnecessary cloud routing. Cloud tiers are never a classifier candidate.
+
+---
+
 ### Traffic log export
 
 The traffic ring buffer is in-memory only — it disappears on restart. Two opt-in export modes:
@@ -64,6 +137,70 @@ The admin UI (port 8081) serves over plain HTTP. Fine on a private network; not 
 ### Response caching (opt-in, request-scoped)
 
 For deterministic or near-deterministic prompts, cache the response against a hash of the full request (model + messages + sampling params). Configurable TTL per profile. **Disabled by default; never shared across profiles.** Most useful for classification pipelines that ask the same question repeatedly.
+
+---
+
+## Long Range
+
+### Priority-aware request queue
+
+A per-model request queue with priority scheduling. The gateway holds back requests to avoid overloading the backend, and processes them in priority order so interactive traffic is never starved by batch work.
+
+**Core idea:** every request carries a `priority` value (integer, default `0`). Lower numbers execute first. The gateway drains all priority-0 requests before starting priority-1, and so on. Tiers can define a default priority so that classification and interactive requests naturally jump ahead of background work.
+
+**Typical priority mapping:**
+| Priority | Use case | Example |
+|----------|----------|---------|
+| `0` (default) | Classification pre-flights, instant-tier | Router classify calls, greetings |
+| `1` | Fast-tier interactive | Device commands, short explanations |
+| `2` | Deep-tier interactive | Complex analysis, code generation |
+| `3+` | Background / batch | Email classification, document labelling |
+
+**"Light" mode is just high-priority-number.** There is no separate model or CPU-only tier. A client sends a request with `priority: 3` (or uses a `light:` alias that maps to an existing tier with `default_priority = 3`). The gateway queues it behind all interactive work. The same model handles it — it just waits its turn.
+
+**Design sketch:**
+
+```toml
+# Tier-level default priority (clients can override downward but not upward)
+[[tiers]]
+name     = "local:instant"
+backend  = "ollama"
+model    = "qwen3:1.7b"
+priority = 0
+
+[[tiers]]
+name     = "local:balanced"
+backend  = "ollama"
+model    = "qwen3:4b"
+priority = 1
+
+[[tiers]]
+name     = "local:expert"
+backend  = "ollama"
+model    = "qwen3:8b"
+priority = 2
+
+# "light" alias — same model, low priority
+[aliases]
+"light:expert" = "local:expert"   # priority overridden to 3 by profile
+```
+
+Key design questions:
+- **Queue per model vs. global**: per-model queues are simpler and match Ollama's internal scheduler (which already serialises within a model). A global queue would allow cross-model priority but adds complexity.
+- **Concurrency limit**: configurable `max_concurrent` per model (default 1 for local, unlimited for cloud backends). Ollama already serialises GPU inference, so the gateway queue prevents piling up HTTP connections that would just block.
+- **Priority ceiling**: profiles can set `max_priority` to prevent clients from jumping the queue — a batch profile would have `default_priority = 3` and `max_priority = 3` (can't escalate to 0).
+- **Queue depth limit**: reject or 429 when the queue exceeds a configurable depth, so a flood of batch requests doesn't consume unbounded memory.
+- **Cloud backends skip the queue**: external backends (Anthropic, OpenRouter) have their own rate limits and don't contend for local GPU — requests to cloud tiers bypass the local queue entirely.
+- **API surface**: `priority` field in the request body (OpenAI-compat extension), or set via profile/tier defaults. No new endpoints needed.
+
+### Deeper model access
+
+Explore options for accessing more capable models within the 17.6 GiB Vulkan VRAM budget on the current hardware:
+
+- **Quantisation**: smaller quants (Q3_K_S, IQ3_XS) of larger models — e.g. qwen3:14b at IQ3_XS (~6 GiB) might fit alongside 1.7b + 4b
+- **Offloading**: partial GPU + CPU offload (`num_gpu = N` layers) for a 14b+ model — slow but functional for deep-tier requests where latency is less critical
+- **External backends**: route deep-tier to a cloud provider (Anthropic, OpenRouter) for tasks that genuinely need 70b+ capability; the gateway already supports this via backend config
+- **Hardware upgrade**: a dedicated GPU card in the Proxmox host would provide a separate VRAM pool; even a used 16 GB card would double available capacity
 
 ---
 

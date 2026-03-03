@@ -1,1 +1,3 @@
 /target
+# Local environment defaults (machine-specific — not committed)
+tools/.env.ps1

@@ -57,12 +57,23 @@ pub async fn client_auth_middleware(
                 .insert(ClientProfile(profile.clone()));
             next.run(req).await
         }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer realm=\"lm-gateway\"")],
-            "Valid client API key required.",
-        )
-            .into_response(),
+        None => {
+            // Fall through to the public profile if one is configured;
+            // otherwise reject with 401.
+            match &state.public_profile {
+                Some(public) => {
+                    req.extensions_mut()
+                        .insert(ClientProfile(public.clone()));
+                    next.run(req).await
+                }
+                None => (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Bearer realm=\"lm-gateway\"")],
+                    "Valid client API key required.",
+                )
+                    .into_response(),
+            }
+        }
     }
 }
 
@@ -102,6 +113,7 @@ mod tests {
                     retry_delay_ms: None,
                     health_window: None,
                     health_error_threshold: None,
+                    public_profile: None,
                 },
                 backends: HashMap::new(),
                 tiers: vec![],

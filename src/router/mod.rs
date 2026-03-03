@@ -1,6 +1,6 @@
 //! Request routing logic — the brain of lm-gateway.
 //!
-//! Two routing modes are supported:
+//! Three routing modes are supported:
 //!
 //! - **Dispatch** (`RoutingMode::Dispatch`): the `model` field in the request is
 //!   resolved through aliases and tier names to a target tier, then forwarded
@@ -8,9 +8,15 @@
 //!   back to the profile's configured fallback tier.
 //!
 //! - **Escalate** (`RoutingMode::Escalate`): the cheapest tier is tried first.
-//!   If the response passes the [`is_sufficient`] heuristic it is returned;
+//!   If the response passes the [`modes::is_sufficient`] heuristic it is returned;
 //!   otherwise the next tier up is tried. This minimises cost for simple queries
 //!   at the expense of higher tail latency on hard ones.
+//!
+//! - **Classify** (`RoutingMode::Classify`): a fast pre-flight inference call
+//!   to the `classifier` tier determines request complexity (`simple`, `moderate`,
+//!   or `complex`), which is mapped to the first, middle, or last tier in the
+//!   profile's auto range. The main inference call is then dispatched to that tier.
+//!   Adds ~200–600 ms latency from the classification call.
 
 use std::{
     collections::HashMap,
@@ -25,9 +31,15 @@ use tracing::{debug, warn};
 use crate::{
     api::rate_limit::RateLimiter,
     backends::{BackendClient, SseStream},
-    config::{Config, RoutingMode, TierConfig},
+    config::{Config, RoutingMode, DEFAULT_CLASSIFIER_PROMPT},
     traffic::{TrafficEntry, TrafficLog},
 };
+
+use self::classify::{parse_classification_label, resolve_tier_by_label};
+use self::modes::{classify_and_dispatch, dispatch, escalate, resolve_target_tier};
+
+mod classify;
+mod modes;
 
 /// Shared application state injected into every request handler via [`axum::extract::State`].
 pub struct RouterState {
@@ -59,6 +71,13 @@ pub struct RouterState {
     /// use the `default` profile (if present) or no profile.
     /// Not updated on hot-reload; restart required to pick up new client keys.
     pub client_map: HashMap<String, String>,
+
+    /// Fallback profile for unauthenticated requests when `[[clients]]` are configured.
+    ///
+    /// When set, requests without a valid Bearer token are routed to this profile
+    /// instead of receiving a 401. Enables open LAN access alongside keyed clients.
+    /// Not updated on hot-reload.
+    pub public_profile: Option<String>,
 
     /// Per-profile shared rate limiters, keyed by profile name.
     ///
@@ -103,6 +122,10 @@ impl RouterState {
         if !profile_limiters.is_empty() {
             tracing::info!(count = profile_limiters.len(), "loaded per-profile rate limiters");
         }
+        let public_profile = config.gateway.public_profile.clone();
+        if let Some(ref p) = public_profile {
+            tracing::info!(profile = %p, "public (unauthenticated) profile configured");
+        }
         Self {
             config_lock: Arc::new(RwLock::new(config)),
             config_path,
@@ -111,6 +134,7 @@ impl RouterState {
             rate_limiter,
             admin_token,
             client_map,
+            public_profile,
             profile_limiters,
         }
     }
@@ -129,10 +153,14 @@ impl RouterState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Route entry points
+// ---------------------------------------------------------------------------
+
 /// Route a `/v1/chat/completions` request body to the appropriate backend tier.
 ///
 /// - Resolves the `model` field through aliases and tier names.
-/// - Selects a routing mode from the active [`ProfileConfig`].
+/// - Selects a routing mode from the active [`crate::config::ProfileConfig`].
 /// - Forwards the (rewritten) request and records a [`TrafficEntry`].
 ///
 /// Returns the raw JSON response from the winning backend, plus the traffic entry
@@ -163,12 +191,20 @@ pub async fn route(
 
     tracing::Span::current().record("tier", target_tier.name.as_str());
 
+    // Inject the profile system prompt before dispatching to any backend.
+    if let Some(prompt) = profile.system_prompt.as_deref() {
+        inject_system_prompt(&mut request_body, prompt);
+    }
+
     let (response, entry) = match profile.mode {
         RoutingMode::Dispatch => {
             dispatch(state, &mut request_body, target_tier, stream).await?
         }
         RoutingMode::Escalate => {
             escalate(state, &mut request_body, profile, stream).await?
+        }
+        RoutingMode::Classify => {
+            classify_and_dispatch(state, &mut request_body, profile, stream).await?
         }
     };
 
@@ -180,6 +216,7 @@ pub async fn route(
         .with_routing_mode(match profile.mode {
             RoutingMode::Dispatch => "dispatch",
             RoutingMode::Escalate => "escalate",
+            RoutingMode::Classify => "classify",
         });
     if let Some(id) = request_id {
         entry = entry.with_id(id);
@@ -190,233 +227,12 @@ pub async fn route(
     Ok((response, entry))
 }
 
-/// Resolve the model hint in the request body to a concrete [`TierConfig`].
-///
-/// Alias indirection is applied first (`hint:fast` → `local:fast`). When the
-/// hint is unrecognised, the profile's fallback tier is used. If
-/// `profile.expert_requires_flag` is `true` and the resolved tier sits above
-/// `max_auto_tier` in the ladder, the request is rejected unless `expert_gate`
-/// is `true` (i.e. the client sent `X-Claw-Expert: true`).
-///
-/// Returns the resolved tier and the original model hint string (needed for
-/// traffic log annotations).
-fn resolve_target_tier<'a>(
-    config: &'a Config,
-    profile: &crate::config::ProfileConfig,
-    request_body: &Value,
-    expert_gate: bool,
-) -> anyhow::Result<(&'a TierConfig, String)> {
-    let model_hint = request_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("hint:fast")
-        .to_owned();
-
-    let target_tier: &TierConfig = match config.resolve_tier(&model_hint) {
-        Some(tier) => tier,
-        None => {
-            warn!(%model_hint, "unknown model/alias — falling back to fallback tier");
-            config
-                .tiers
-                .iter()
-                .find(|t| t.name == profile.classifier)
-                .context("fallback tier not found in config")?
-        }
-    };
-
-    // Enforce expert gate: tiers above max_auto_tier require an explicit opt-in.
-    if profile.expert_requires_flag && !expert_gate {
-        let max_idx = config
-            .tiers
-            .iter()
-            .position(|t| t.name == profile.max_auto_tier)
-            .unwrap_or_else(|| config.tiers.len().saturating_sub(1));
-        let tier_idx = config
-            .tiers
-            .iter()
-            .position(|t| t.name == target_tier.name)
-            .unwrap_or(0);
-        if tier_idx > max_idx {
-            anyhow::bail!(
-                "tier `{}` requires the `X-Claw-Expert: true` header",
-                target_tier.name
-            );
-        }
-    }
-
-    Ok((target_tier, model_hint))
-}
-
-/// Mode A: classify up-front and dispatch directly to the resolved tier.
-///
-/// The request body is mutated in place to rewrite `model` and `stream`
-/// before being forwarded — no copy of the full body is made.
-///
-/// Retries up to `config.gateway.max_retries` times on failure, with
-/// exponential backoff starting at `config.gateway.retry_delay_ms` (default
-/// 200 ms), doubling per attempt, capped at 2 000 ms. On exhaustion the last
-/// error is returned — in escalate mode this bubbles up to trigger escalation
-/// to the next tier.
-async fn dispatch(
-    state: &RouterState,
-    body: &mut Value,
-    tier: &TierConfig,
-    stream: bool,
-) -> anyhow::Result<(Value, TrafficEntry)> {
-    let config = state.config();
-    let backend_cfg = config
-        .backends
-        .get(&tier.backend)
-        .with_context(|| format!("backend `{}` not in config", tier.backend))?;
-
-    // Rewrite the model field to the backend's model name
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("model".into(), Value::String(tier.model.clone()));
-        obj.insert("stream".into(), Value::Bool(stream));
-    }
-
-    let max_retries = config.gateway.max_retries.unwrap_or(0);
-    let retry_delay_ms = config.gateway.retry_delay_ms.unwrap_or(200);
-
-    debug!(
-        tier = %tier.name,
-        backend = %tier.backend,
-        model = %tier.model,
-        max_retries,
-        "dispatching"
-    );
-
-    let client = BackendClient::new(backend_cfg)?;
-    let mut last_err: anyhow::Error = anyhow::anyhow!("no attempts made");
-    let mut delay_ms = retry_delay_ms;
-
-    for attempt in 0..=max_retries {
-        if attempt > 0 {
-            let sleep = std::cmp::min(delay_ms, 2_000);
-            warn!(
-                tier = %tier.name,
-                attempt,
-                delay_ms = sleep,
-                "retrying after backend error"
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(sleep)).await;
-            delay_ms = delay_ms.saturating_mul(2);
-        }
-
-        let t0 = std::time::Instant::now();
-        match client.chat_completions(body.clone()).await {
-            Ok(response) => {
-                let latency_ms = t0.elapsed().as_millis() as u64;
-                let entry = TrafficEntry::new(
-                    tier.name.clone(),
-                    tier.backend.clone(),
-                    latency_ms,
-                    true,
-                );
-                return Ok((response, entry));
-            }
-            Err(e) => {
-                last_err = e;
-            }
-        }
-    }
-
-    Err(last_err)
-}
-
-/// Mode B: try tiers cheapest-first and return the first sufficient response.
-///
-/// Iteration stops at `profile.max_auto_tier`. Backend failures and insufficient
-/// responses both cause escalation to the next tier. If every tier is exhausted
-/// without a sufficient response an error is returned.
-async fn escalate(
-    state: &RouterState,
-    body: &mut Value,
-    profile: &crate::config::ProfileConfig,
-    stream: bool,
-) -> anyhow::Result<(Value, TrafficEntry)> {
-    let config = state.config();
-    // Collect candidate tiers up to max_auto_tier
-    let max_idx = config
-        .tiers
-        .iter()
-        .position(|t| t.name == profile.max_auto_tier)
-        .unwrap_or(config.tiers.len() - 1);
-
-    let candidates: Vec<&TierConfig> = config.tiers[..=max_idx].iter().collect();
-
-    // Pre-fetch backend health snapshot so degraded backends can be skipped.
-    let health_window = config.gateway.health_window.unwrap_or(10);
-    let health_threshold = config.gateway.health_error_threshold.unwrap_or(0.7);
-    let backend_health = if health_window > 0 {
-        state.traffic.backend_health(health_window, health_threshold).await
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    for (tier_idx, tier) in candidates.iter().enumerate() {
-        // Skip tiers whose backends are currently degraded (too many recent errors).
-        if health_window > 0 {
-            if let Some(health) = backend_health.get(&tier.backend) {
-                if !health.healthy {
-                    warn!(
-                        tier = %tier.name,
-                        backend = %tier.backend,
-                        error_rate = health.error_rate,
-                        window = health.total,
-                        "skipping unhealthy backend — escalating"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        let backend_cfg = match config.backends.get(&tier.backend) {
-            Some(b) => b,
-            None => continue,
-        };
-
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".into(), Value::String(tier.model.clone()));
-            obj.insert("stream".into(), Value::Bool(stream));
-        }
-
-        let client = match BackendClient::new(backend_cfg) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(tier = %tier.name, error = %e, "skipping tier — client build failed");
-                continue;
-            }
-        };
-
-        let t0 = std::time::Instant::now();
-        match client.chat_completions(body.clone()).await {
-            Ok(response) => {
-                let latency_ms = t0.elapsed().as_millis() as u64;
-                if is_sufficient(&response) {
-                    let mut entry =
-                        TrafficEntry::new(tier.name.clone(), tier.backend.clone(), latency_ms, true);
-                    if tier_idx > 0 {
-                        entry = entry.mark_escalated();
-                    }
-                    return Ok((response, entry));
-                }
-                debug!(tier = %tier.name, "response insufficient — escalating");
-            }
-            Err(e) => {
-                warn!(tier = %tier.name, error = %e, "tier request failed — escalating");
-            }
-        }
-    }
-
-    // Exhausted all tiers — last resort: use the final candidate anyway
-    anyhow::bail!("all tiers exhausted without a sufficient response")
-}
-
 /// Route a streaming `/v1/chat/completions` request.
 ///
 /// Streaming bypasses escalation — the first matching tier is dispatched to
 /// directly, and the backend's SSE output is returned as an [`SseStream`].
+/// In `classify` mode a non-streaming pre-flight call determines which tier to
+/// stream from; escalation mode falls back to dispatch behaviour.
 /// All backends produce OpenAI-compatible SSE: OpenAI-compatible and Ollama
 /// backends proxy bytes verbatim; Anthropic translates on-the-fly.
 #[tracing::instrument(skip(state, request_body), fields(profile = profile_name.unwrap_or("default")))]
@@ -426,15 +242,122 @@ pub async fn route_stream(
     profile_name: Option<&str>,
     request_id: Option<&str>,
     expert_gate: bool,
-) -> anyhow::Result<(SseStream, TrafficEntry)> {
+    use_native: bool,
+) -> anyhow::Result<(SseStream, TrafficEntry, bool)> {
     let profile_name = profile_name.unwrap_or("default");
     let config = state.config();
     let profile = config
         .profile(profile_name)
         .context("no matching profile and no default profile configured")?;
 
-    let (target_tier, model_hint) =
+    let (resolved_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
+
+    // Inject the profile system prompt before dispatching to any backend.
+    if let Some(prompt) = profile.system_prompt.as_deref() {
+        inject_system_prompt(&mut request_body, prompt);
+    }
+
+    // In classify mode, run a non-streaming classification call first to pick
+    // the best tier, then stream from that tier instead of the resolved one.
+    let target_tier_name: String = if profile.mode == RoutingMode::Classify {
+        let classifier_tier = config
+            .tiers
+            .iter()
+            .find(|t| t.name == profile.classifier)
+            .context("classifier tier not found in config")?;
+
+        let backend_cfg = config
+            .backends
+            .get(&classifier_tier.backend)
+            .with_context(|| format!("backend `{}` not in config", classifier_tier.backend))?
+            .clone();
+
+        let user_text = request_body
+            .pointer("/messages")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            })
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .map(|s| s.to_owned());
+
+        if let Some(user_text) = user_text {
+            let system_prompt = profile
+                .classifier_prompt
+                .as_deref()
+                .unwrap_or(DEFAULT_CLASSIFIER_PROMPT);
+
+            let max_idx = config
+                .tiers
+                .iter()
+                .position(|t| t.name == profile.max_auto_tier)
+                .unwrap_or(config.tiers.len().saturating_sub(1));
+            let candidates = &config.tiers[..=max_idx];
+            let n = candidates.len();
+
+            let classifier_body = serde_json::json!({
+                "model": classifier_tier.model,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user",   "content": &user_text   }
+                ],
+                "stream": false,
+                "think": false,
+                // num_predict and temperature go in options for Ollama native /api/chat.
+                "options": { "num_predict": 5, "temperature": 0 }
+            });
+
+            let client = BackendClient::new(&backend_cfg)?;
+            let (label, think_override) = match client.classify(classifier_body).await {
+                Ok(r) => {
+                    let parsed = parse_classification_label(&r);
+                    debug!(label = %parsed.0, think_override = ?parsed.1, "stream classify resolved");
+                    parsed
+                }
+                Err(e) => {
+                    warn!(err = %e, "stream classify call failed — defaulting to first tier");
+                    (String::from("instant"), None)
+                }
+            };
+
+            let has_tool_result = request_body
+                .pointer("/messages")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().any(|m| {
+                    m.get("role").and_then(Value::as_str) == Some("tool")
+                }))
+                .unwrap_or(false);
+
+            let mut target_tier = resolve_tier_by_label(&label, candidates);
+            if has_tool_result && std::ptr::eq(target_tier, &candidates[0]) && n > 1 {
+                debug!("tool-result — bumping from cheapest tier to next");
+                target_tier = &candidates[1];
+            }
+
+            // Inject think override before streaming dispatch.
+            if let Some(t) = think_override {
+                if let Some(obj) = request_body.as_object_mut() {
+                    obj.insert("think".into(), Value::Bool(t));
+                }
+            }
+
+            debug!(label = %label, tier = %target_tier.name, "stream classify resolved");
+            target_tier.name.clone()
+        } else {
+            classifier_tier.name.clone()
+        }
+    } else {
+        resolved_tier.name.clone()
+    };
+
+    let target_tier = config
+        .tiers
+        .iter()
+        .find(|t| t.name == target_tier_name)
+        .with_context(|| format!("resolved tier `{target_tier_name}` not found"))?;
 
     let backend_cfg = config
         .backends
@@ -444,14 +367,41 @@ pub async fn route_stream(
     if let Some(obj) = request_body.as_object_mut() {
         obj.insert("model".into(), Value::String(target_tier.model.clone()));
         obj.insert("stream".into(), Value::Bool(true));
+        // Inject the tier's think preference as fallback; per-request overrides
+        // (from -think classifier labels) are already in request_body and take precedence.
+        if let Some(think) = target_tier.think {
+            obj.entry("think").or_insert(Value::Bool(think));
+        }
     }
 
     debug!(tier = %target_tier.name, backend = %target_tier.backend, "streaming dispatch");
 
     let client = BackendClient::new(backend_cfg)?;
     let t0 = std::time::Instant::now();
-    let stream_response = client.chat_completions_stream(request_body).await?;
+
+    // Detect tool-call requests: Ollama's /v1/chat/completions compat layer fails
+    // to translate <tool_call> output to a tool_calls JSON array.  Route through
+    // the native /api/chat endpoint instead, which does the translation correctly.
+    let has_tools = request_body
+        .pointer("/tools")
+        .and_then(Value::as_array)
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+
+    let (stream_response, is_native_ndjson) = if use_native {
+        client.native_chat_stream(request_body).await?
+    } else if has_tools {
+        debug!("request has tools — routing via native /api/chat to fix tool_call translation");
+        client.tool_call_stream(request_body).await?
+    } else {
+        (client.chat_completions_stream(request_body).await?, false)
+    };
     let latency_ms = t0.elapsed().as_millis() as u64;
+
+    let routing_mode = match profile.mode {
+        RoutingMode::Classify => "classify+stream",
+        _ => "stream",
+    };
 
     // Latency here is time-to-first-byte (connection + headers), not full response.
     let mut entry = TrafficEntry::new(
@@ -462,60 +412,60 @@ pub async fn route_stream(
     )
     .with_profile(profile_name)
     .with_requested_model(&model_hint)
-    .with_routing_mode("stream");
+    .with_routing_mode(routing_mode);
     if let Some(id) = request_id {
         entry = entry.with_id(id);
     }
 
     state.traffic.push(entry.clone());
 
-    Ok((stream_response, entry))
+    Ok((stream_response, entry, is_native_ndjson))
 }
 
-/// Decide whether a backend response is good enough to return or should be escalated.
-///
-/// # ⚠️ Heuristic stopgap
-///
-/// This is a best-effort heuristic, not a reliable quality gate. It will produce
-/// false positives (escalating a valid response) and false negatives (accepting a
-/// low-quality one). Use escalation mode only where the occasional wrong call is
-/// acceptable. Do not extend this without measuring against real data.
-///
-/// Current checks:
-/// - Responses shorter than 20 characters are almost certainly non-answers.
-/// - A small set of refusal phrases indicate the model couldn't or wouldn't help.
-pub(crate) fn is_sufficient(response: &Value) -> bool {
-    // Extract the content from the first choice
-    let content = response
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-    // Escalate if the response is very short (likely a non-answer)
-    if content.len() < 20 {
-        return false;
+/// Prepend the profile system prompt into the request's messages array.
+///
+/// If the first message already has `role = "system"`, the profile prompt is
+/// placed before its content (separated by `\n\n`), so client-provided context
+/// is preserved while the profile's instructions take precedence.
+/// If there is no existing system message, one is inserted at index 0.
+fn inject_system_prompt(body: &mut Value, prompt: &str) {
+    let Some(messages) = body.pointer_mut("/messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    if let Some(first) = messages.first_mut() {
+        if first.get("role").and_then(Value::as_str) == Some("system") {
+            let existing = first
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let merged = if existing.is_empty() {
+                prompt.to_owned()
+            } else {
+                format!("{prompt}\n\n{existing}")
+            };
+            if let Some(obj) = first.as_object_mut() {
+                obj.insert("content".into(), Value::String(merged));
+            }
+            return;
+        }
     }
 
-    // Escalate if the model explicitly refuses
-    let lower = content.to_lowercase();
-    let refusal_phrases = [
-        "i don't know",
-        "i cannot help",
-        "i'm not able to",
-        "as an ai",
-        "i don't have enough information",
-    ];
-    if refusal_phrases.iter().any(|p| lower.contains(p)) {
-        return false;
-    }
-
-    true
+    messages.insert(0, serde_json::json!({ "role": "system", "content": prompt }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use self::classify::{parse_classification_label, resolve_tier_by_label};
+    use self::modes::is_sufficient;
 
     // -----------------------------------------------------------------------
     // is_sufficient — pure heuristic, no I/O required
@@ -599,6 +549,7 @@ mod tests {
                 retry_delay_ms: None,
                 health_window: None,
                 health_error_threshold: None,
+                public_profile: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -619,11 +570,13 @@ mod tests {
                     name: "local:fast".into(),
                     backend: "mock".into(),
                     model: "fast-model".into(),
+                    think: None,
                 },
                 TierConfig {
                     name: "cloud:economy".into(),
                     backend: "mock".into(),
                     model: "economy-model".into(),
+                    think: None,
                 },
             ],
             aliases: {
@@ -641,6 +594,8 @@ mod tests {
                         max_auto_tier: "cloud:economy".into(),
                         expert_requires_flag: false,
                         rate_limit_rpm: None,
+                        classifier_prompt: None,
+                        system_prompt: None,
                     },
                 );
                 m
@@ -755,6 +710,7 @@ mod tests {
                     retry_delay_ms: None,
                     health_window: None,
                     health_error_threshold: None,
+                    public_profile: None,
                 },
                 backends: std::collections::HashMap::new(),
                 tiers: vec![],
@@ -792,5 +748,185 @@ mod tests {
         let (_, entry) = route(&state, body, None, None, false, false).await.unwrap();
         // classifier is "local:fast"
         assert_eq!(entry.tier, "local:fast");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_classification_label — pure, no I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_label_simple_returns_simple_no_think() {
+        let r = json!({"choices": [{"message": {"content": "simple"}}]});
+        let (label, think) = parse_classification_label(&r);
+        assert_eq!(label, "simple");
+        assert!(think.is_none());
+    }
+
+    #[test]
+    fn parse_label_trailing_punctuation_is_stripped() {
+        let cases = [("complex.", "complex"), ("[deep]", "deep"), ("(moderate)", "moderate")];
+        for (input, want) in cases {
+            let r = json!({"choices": [{"message": {"content": input}}]});
+            let (label, _) = parse_classification_label(&r);
+            assert_eq!(label, want, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn parse_label_think_suffix_sets_override() {
+        for prefix in ["deep", "max", "instant"] {
+            let content = format!("{prefix}-think");
+            let r = json!({"choices": [{"message": {"content": content}}]});
+            let (label, think) = parse_classification_label(&r);
+            assert_eq!(label, prefix, "prefix: {prefix}");
+            assert_eq!(think, Some(true));
+        }
+    }
+
+    #[test]
+    fn parse_label_no_think_suffix_has_no_override() {
+        let r = json!({"choices": [{"message": {"content": "deep"}}]});
+        let (label, think) = parse_classification_label(&r);
+        assert_eq!(label, "deep");
+        assert!(think.is_none());
+    }
+
+    #[test]
+    fn parse_label_multiword_response_uses_first_token() {
+        let r = json!({"choices": [{"message": {"content": "moderate. This task is complex"}}]});
+        let (label, _) = parse_classification_label(&r);
+        assert_eq!(label, "moderate");
+    }
+
+    #[test]
+    fn parse_label_is_lowercased() {
+        let r = json!({"choices": [{"message": {"content": "COMPLEX"}}]});
+        let (label, _) = parse_classification_label(&r);
+        assert_eq!(label, "complex");
+    }
+
+    #[test]
+    fn parse_label_missing_content_returns_empty() {
+        let (label, think) = parse_classification_label(&json!({}));
+        assert_eq!(label, "");
+        assert!(think.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_tier_by_label — pure, no I/O
+    // -----------------------------------------------------------------------
+
+    fn make_tiers(names: &[&str]) -> Vec<TierConfig> {
+        names
+            .iter()
+            .map(|&n| TierConfig {
+                name: n.to_owned(),
+                backend: "b".into(),
+                model: "m".into(),
+                think: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolve_exact_full_name_matches() {
+        let tiers = make_tiers(&["local:instant", "local:fast", "cloud:pro"]);
+        let resolved = resolve_tier_by_label("local:fast", &tiers);
+        assert_eq!(resolved.name, "local:fast");
+    }
+
+    #[test]
+    fn resolve_suffix_after_colon_matches() {
+        let tiers = make_tiers(&["local:instant", "local:fast", "cloud:pro"]);
+        assert_eq!(resolve_tier_by_label("fast", &tiers).name, "local:fast");
+        assert_eq!(resolve_tier_by_label("pro", &tiers).name, "cloud:pro");
+        assert_eq!(resolve_tier_by_label("instant", &tiers).name, "local:instant");
+    }
+
+    #[test]
+    fn resolve_unknown_label_falls_back_to_middle_tier() {
+        // Routing is name-driven — unrecognised labels fall back to middle.
+        // This includes generic words (simple, complex, moderate) that are not
+        // tier names; the classifier_prompt is the contract for valid labels.
+        let tiers = make_tiers(&["t0", "t1", "t2"]);
+        for label in ["simple", "complex", "moderate", "totally_unknown", "haiku", "opus"] {
+            assert_eq!(
+                resolve_tier_by_label(label, &tiers).name,
+                "t1",
+                "expected unknown label '{label}' to fall back to middle tier"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_single_tier_always_returns_it() {
+        let tiers = make_tiers(&["only"]);
+        for label in ["unknown_xyz", "exact_mismatch", ""] {
+            assert_eq!(
+                resolve_tier_by_label(label, &tiers).name,
+                "only",
+                "label: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_exact_name_takes_priority_over_suffix() {
+        // A tier named "fast" must be found by exact match, not confused with
+        // any other tier whose name ends in ":fast".
+        let tiers = make_tiers(&["local:fast", "fast", "cloud:pro"]);
+        let resolved = resolve_tier_by_label("fast", &tiers);
+        // Exact match for "fast" should win; "local:fast" has it as a suffix
+        // but exact match is checked first.
+        assert_eq!(resolved.name, "fast");
+    }
+
+    // -----------------------------------------------------------------------
+    // inject_system_prompt — pure, no I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inject_inserts_system_message_when_none_exists() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        inject_system_prompt(&mut body, "Be helpful.");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "Be helpful.");
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn inject_prepends_to_existing_system_message() {
+        let mut body = json!({
+            "messages": [
+                {"role": "system", "content": "Original context."},
+                {"role": "user",   "content": "hello"}
+            ]
+        });
+        inject_system_prompt(&mut body, "Profile prompt.");
+        let msgs = body["messages"].as_array().unwrap();
+        // No new message — profile prompt merges into the existing system message.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "Profile prompt.\n\nOriginal context.");
+    }
+
+    #[test]
+    fn inject_prepends_to_empty_existing_system_message() {
+        let mut body = json!({
+            "messages": [{"role": "system", "content": ""}]
+        });
+        inject_system_prompt(&mut body, "Only this.");
+        // Empty existing content — result should just be the injected prompt.
+        assert_eq!(body["messages"][0]["content"], "Only this.");
+    }
+
+    #[test]
+    fn inject_is_noop_when_messages_key_is_absent() {
+        let mut body = json!({"model": "foo"});
+        inject_system_prompt(&mut body, "prompt");
+        assert!(body.get("messages").is_none());
     }
 }

@@ -7,124 +7,93 @@
 use std::sync::Arc;
 
 use axum::{
-    body::Body,
-    extract::{Extension, State},
-    response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use serde_json::{json, Value};
 
-use crate::{
-    api::{client_auth::ClientProfile, request_id::RequestId},
-    backends::SseStream,
-    error::AppError,
-    router::RouterState,
-};
+use crate::router::RouterState;
+
+mod ollama;
+mod openai;
 
 /// Build the client-facing axum router (port 8080).
 pub fn router(state: Arc<RouterState>) -> Router {
     Router::new()
         .route("/healthz", get(crate::api::health::healthz))
         .route("/status", get(crate::api::status::status))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/models", get(openai::list_models))
+        // Ollama-compatible discovery — used by Home Assistant's Ollama integration
+        // and any client that enumerates models via the native Ollama API.
+        .route("/api/tags", get(ollama::list_models_ollama))
+        .route("/api/chat", post(ollama::chat_completions_ollama))
         .with_state(state)
 }
 
-/// `POST /v1/chat/completions` — route a chat request through the tier ladder.
+/// Classify a backend error into a short, user-readable message.
 ///
-/// When `stream: true` is set in the request body, the response is proxied as
-/// a raw SSE stream from the backend (no buffering). Escalation is skipped for
-/// streaming requests — the first matching tier is used directly. All backends
-/// produce OpenAI-compatible SSE (Anthropic is translated on-the-fly).
-pub async fn chat_completions(
-    State(state): State<Arc<RouterState>>,
-    request_id_ext: Option<Extension<RequestId>>,
-    client_profile: Option<Extension<ClientProfile>>,
-    headers: axum::http::HeaderMap,
-    Json(body): Json<Value>,
-) -> Result<Response, AppError> {
-    let expert_gate = headers
-        .get("x-claw-expert")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let req_id = request_id_ext.map(|Extension(id)| id.0);
-    let profile = client_profile.map(|Extension(p)| p.0);
-    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-
-    // Per-profile rate limit: shared quota across all clients on the same profile.
-    let profile_name = profile.as_deref().unwrap_or("default");
-    if let Some(limiter) = state.profile_limiters.get(profile_name) {
-        if let Err(retry_after) = limiter.check_global() {
-            use axum::http::StatusCode;
-            return Ok((
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    ("retry-after", retry_after.to_string()),
-                    ("x-ratelimit-limit", limiter.rpm.to_string()),
-                    ("x-ratelimit-policy", format!("{};w=60", limiter.rpm)),
-                    ("x-ratelimit-scope", "profile".to_string()),
-                    ("content-type", "text/plain".to_string()),
-                ],
-                "Profile rate limit exceeded. Please retry after the indicated delay.",
-            )
-                .into_response());
-        }
+/// Inspects the error chain for known patterns (timeouts, HTTP status codes,
+/// missing models) and returns an appropriate explanation. The message is
+/// intentionally terse — it will appear directly in the chat UI.
+fn classify_backend_error(err: &anyhow::Error) -> &'static str {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("elapsed") {
+        "The language model took too long to respond. Please try again."
+    } else if lower.contains("http 404") || lower.contains("not found") {
+        "The requested model isn't available right now. Please check the gateway configuration."
+    } else if lower.contains("http 5") || lower.contains("502") || lower.contains("503") || lower.contains("504") {
+        "The language model backend returned an error. Please try again in a moment."
+    } else if lower.contains("connection refused") || lower.contains("connect error") {
+        "Cannot reach the language model backend. Please try again later."
+    } else if lower.contains("no profile") || lower.contains("unknown profile") || lower.contains("not configured") {
+        "No routing profile is configured for this request."
+    } else {
+        "Something went wrong while processing your request. Please try again."
     }
-
-    if streaming {
-        let (stream, _entry) =
-            crate::router::route_stream(&state, body, profile.as_deref(), req_id.as_deref(), expert_gate).await?;
-        return Ok(proxy_sse(stream));
-    }
-
-    let (resp, _entry) =
-        crate::router::route(&state, body, profile.as_deref(), req_id.as_deref(), false, expert_gate).await?;
-    Ok(Json(resp).into_response())
 }
 
-/// Proxy an [`SseStream`] to the client as a streaming HTTP response.
+/// Build an OpenAI-compatible chat completion response carrying an error message.
 ///
-/// Sets `content-type: text/event-stream`, `cache-control: no-cache`, and
-/// `x-accel-buffering: no` (disables nginx buffering when lm-gateway sits
-/// behind a reverse proxy such as Caddy).
-fn proxy_sse(stream: SseStream) -> Response {
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("x-accel-buffering", "no")
-        .body(Body::from_stream(stream))
-        .expect("proxy_sse: failed to build streaming response")
+/// Returns HTTP 200 with a valid `chat.completion` object so that clients
+/// such as Home Assistant Assist render the message in the chat UI instead
+/// of showing a generic "Oops" error dialog.
+fn error_openai_response(err: &anyhow::Error, model: &str) -> Value {
+    let text = classify_backend_error(err);
+    tracing::warn!(error = %err, user_message = text, "returning error as chat response");
+    json!({
+        "id":      "chatcmpl-error",
+        "object":  "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model":   model,
+        "choices": [{
+            "index":   0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+    })
 }
 
-/// `GET /v1/models` — list available tiers and aliases as model objects.
+/// Build an Ollama-compatible chat response carrying an error message.
 ///
-/// Returns an OpenAI-compatible model list so clients can enumerate what
-/// routing targets are available without any out-of-band config.
-pub async fn list_models(State(state): State<Arc<RouterState>>) -> impl IntoResponse {
-    let config = state.config();
-    let tiers = config.tiers.iter().map(|t| {
-        json!({
-            "id": t.name,
-            "object": "model",
-            "owned_by": t.backend,
-        })
-    });
-
-    let aliases = config.aliases.iter().map(|(alias, target)| {
-        json!({
-            "id": alias,
-            "object": "model",
-            "owned_by": "alias",
-            "lm_gateway": { "resolves_to": target },
-        })
-    });
-
-    let data: Vec<Value> = tiers.chain(aliases).collect();
-    Json(json!({ "object": "list", "data": data }))
+/// Same intent as [`error_openai_response`] but in the Ollama wire format
+/// used by `POST /api/chat`.
+fn error_ollama_response(err: &anyhow::Error, model: &str) -> Value {
+    let text = classify_backend_error(err);
+    tracing::warn!(error = %err, user_message = text, "returning error as ollama chat response");
+    json!({
+        "model":      model,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "message":    { "role": "assistant", "content": text },
+        "done":       true,
+        "done_reason": "stop",
+        "total_duration":    0,
+        "load_duration":     0,
+        "prompt_eval_count": 0,
+        "eval_count":        0
+    })
 }
 
 #[cfg(test)]
@@ -167,6 +136,7 @@ mod tests {
                 retry_delay_ms: None,
                 health_window: None,
                 health_error_threshold: None,
+                public_profile: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -187,11 +157,13 @@ mod tests {
                     name: "local:fast".into(),
                     backend: "mock".into(),
                     model: "fast-model".into(),
+                    think: None,
                 },
                 TierConfig {
                     name: "cloud:economy".into(),
                     backend: "mock".into(),
                     model: "economy-model".into(),
+                    think: None,
                 },
             ],
             aliases: {
@@ -209,6 +181,8 @@ mod tests {
                         max_auto_tier: "cloud:economy".into(),
                         expert_requires_flag: false,
                         rate_limit_rpm: None,
+                        classifier_prompt: None,
+                        system_prompt: None,
                     },
                 );
                 m
@@ -326,8 +300,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_returns_500_when_backend_is_unreachable() {
+    async fn chat_completions_returns_user_friendly_message_when_backend_is_unreachable() {
         // Port 1 is reserved and never responds — guaranteed connection refusal.
+        // The gateway wraps backend errors as HTTP 200 chat responses so that
+        // clients like Home Assistant Assist show the message in the chat UI
+        // instead of a generic error dialog.
         let app = super::router(state_with_backend("http://127.0.0.1:1"));
         let req = Request::builder()
             .method("POST")
@@ -342,11 +319,14 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // HTTP 200 — error is surfaced as a chat message, not a raw HTTP error.
+        assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
-        assert!(json["error"].is_string());
+        // Should be a valid OpenAI chat.completion with an assistant error message.
+        let content = json
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .expect("error response should carry a content message");
+        assert!(!content.is_empty(), "error message should not be empty");
     }
 }
-
-
-

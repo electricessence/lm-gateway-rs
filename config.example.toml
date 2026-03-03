@@ -1,6 +1,31 @@
 # lm-gateway example configuration
 # Copy to config.toml and adjust values for your environment.
 # NEVER put secret values directly in this file — use api_key_env to name an env var.
+#
+# ─── conf.d/ overlay directory ───────────────────────────────────────────────
+# Place any number of *.toml files in a conf.d/ directory next to config.toml.
+# They are loaded alphabetically and merged on top of config.toml at startup.
+# Only the keys / entries you include are overridden — everything else is kept.
+#
+# Typical use-cases:
+#   conf.d/10-local.toml     — machine-specific backend URLs (not in git)
+#   conf.d/20-models.toml    — swap model names per deployment
+#   conf.d/30-clients.toml   — add API clients without editing base config
+#
+# Merge rules:
+#   [backends.*], [gateway], [profiles.*]   →  key-level: overlay wins per key
+#   [[tiers]], [[clients]]                  →  same `name` = replaced in-place;
+#                                              new `name` = appended
+#
+# Example conf.d/10-local.toml:
+#   [backends.ollama]
+#   base_url = "http://192.168.1.50:11434"
+#
+#   [[tiers]]
+#   name    = "local:fast"
+#   backend = "ollama"
+#   model   = "qwen3:1.7b"
+# ─────────────────────────────────────────────────────────────────────────────
 
 [gateway]
 client_port = 8080       # agent-facing client API
@@ -61,17 +86,17 @@ backend = "ollama"
 model   = "qwen2.5:1.5b"
 
 [[tiers]]
-name    = "local:capable"
+name    = "local:deep"
 backend = "ollama"
 model   = "qwen2.5:7b"
 
 [[tiers]]
-name    = "cloud:economy"
+name    = "cloud:fast"
 backend = "openrouter"
 model   = "anthropic/claude-haiku-4-5"
 
 [[tiers]]
-name    = "cloud:standard"
+name    = "cloud:deep"
 backend = "openrouter"
 model   = "anthropic/claude-sonnet-4-5"
 
@@ -87,9 +112,9 @@ model   = "anthropic/claude-opus-4-5"
 [aliases]
 "hint:fast"     = "local:fast"
 "hint:cheap"    = "local:fast"
-"hint:local"    = "local:capable"
-"hint:cloud"    = "cloud:economy"
-"hint:standard" = "cloud:standard"
+"hint:local"    = "local:deep"
+"hint:cloud"    = "cloud:fast"
+"hint:standard" = "cloud:deep"
 "hint:expert"   = "cloud:expert"
 
 # ---------------------------------------------------------------------------
@@ -97,9 +122,9 @@ model   = "anthropic/claude-opus-4-5"
 # ---------------------------------------------------------------------------
 
 [profiles.default]
-mode               = "dispatch"       # "dispatch" | "escalate"
+mode               = "dispatch"       # "dispatch" | "escalate" | "classify"
 classifier         = "local:fast"     # tier used for intent classification (dispatch mode)
-max_auto_tier      = "cloud:economy"  # ceiling before expert_requires_flag kicks in
+max_auto_tier      = "cloud:fast"     # ceiling before expert_requires_flag kicks in
 expert_requires_flag = true           # client must set X-Claw-Expert: true to reach expert tier
 # rate_limit_rpm = 120               # total RPM shared by ALL clients on this profile
 
@@ -107,9 +132,92 @@ expert_requires_flag = true           # client must set X-Claw-Expert: true to r
 [profiles.escalating]
 mode               = "escalate"
 classifier         = "local:fast"
-max_auto_tier      = "cloud:standard"
+max_auto_tier      = "cloud:deep"
 expert_requires_flag = true
 # rate_limit_rpm = 60                # tighter quota for escalating (more expensive) callers
+
+# Classify profile — uses a fast model to label request complexity, then dispatches
+# to the matching tier. The classifier returns one of: instant, instant-think,
+# fast, fast-think, deep, deep-think. Each label is matched against tier names
+# by suffix (e.g. "fast" → first tier whose name ends with "fast") with a middle-
+# tier fallback for unknown labels. Tier names ending in the label word are the
+# recommended convention — see the local-only example at the bottom of this file.
+#
+# Ollama-compatibility endpoints expose PROFILE NAMES as models, not raw tiers:
+#   GET  /api/tags      — returns {"models": [{"name":"auto:latest"}, ...]}
+#   POST /api/chat      — model="auto" routes through this profile transparently
+# Point Home Assistant or Open WebUI at this gateway and it sees your profiles
+# as selectable "models" — the tier ladder is fully hidden.
+[profiles.auto]
+mode               = "classify"
+classifier         = "local:fast"   # tier used for the pre-flight classification call
+max_auto_tier      = "cloud:expert" # ceiling tier; exclude cloud:expert to cap at cloud:deep
+# classifier_prompt = "..."         # override the built-in classification prompt (v16, 27/27 on 27-case HA benchmark)
+# system_prompt     = "..."         # prepended to every request forwarded through this profile
+
+# Home Assistant smart-routing profile.
+# Exposes as model "ha-auto" in /api/tags — point HA's Ollama integration here.
+# Injects an HA-aware system prompt into every request so models understand the context,
+# then classifies complexity to route to the cheapest capable tier automatically.
+[profiles.ha-auto]
+mode           = "classify"
+classifier     = "local:fast"
+max_auto_tier  = "cloud:deep"   # override to cloud:expert if you want opus; keep deep for cost control
+system_prompt  = """
+You are an AI assistant integrated with Home Assistant (HA), an open-source home automation platform.
+Help the user with smart home queries, configuration, automations, and troubleshooting.
+
+Guidelines:
+- Be concise. Short direct answers for simple questions; full configs for automation requests.
+- Write automations and scripts in valid Home Assistant YAML using the modern trigger/condition/action syntax.
+- Reference entities by their full entity_id (e.g. light.living_room, switch.kitchen, sensor.outdoor_temperature).
+- For blueprints or complex automations, provide complete, copy-paste-ready YAML.
+- If the user asks about an entity state or service call, use HA naming conventions.
+"""
+
+# ---------------------------------------------------------------------------
+# Local-only smart router example (3-tier — no cloud required)
+# ---------------------------------------------------------------------------
+# Minimal config to run a fully local classify router that any Ollama client
+# (Home Assistant, Open WebUI, etc.) can point at on port 8080.
+#
+# GET /api/tags returns {"models": [{"name":"auto:latest"}, {"name":"direct:latest"}]}
+# The client picks a profile name as its "model" — tiers are never exposed.
+#
+# [gateway]
+# client_port = 8080
+#
+# [backends.ollama]
+# provider = "ollama"
+# base_url = "http://127.0.0.1:11434"
+#
+# [[tiers]]
+# name    = "local:instant"
+# backend = "ollama"
+# model   = "<fastest-model>"
+#
+# [[tiers]]
+# name    = "local:fast"
+# backend = "ollama"
+# model   = "<mid-model>"
+#
+# [[tiers]]
+# name    = "local:deep"
+# backend = "ollama"
+# model   = "<most-capable-model>"
+#
+# # "auto" is what HA/Open WebUI picks from /api/tags.
+# # Complexity classification routes to instant, fast, or deep transparently.
+# [profiles.auto]
+# mode       = "classify"
+# classifier = "local:instant"
+# max_auto_tier = "local:deep"
+#
+# # "direct" always hits the deepest model — no classification overhead.
+# [profiles.direct]
+# mode       = "dispatch"
+# classifier = "local:deep"
+# max_auto_tier = "local:deep"
 
 # ---------------------------------------------------------------------------
 # Clients — per-client API key → profile bindings
