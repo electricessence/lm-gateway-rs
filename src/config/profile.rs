@@ -1,5 +1,7 @@
 //! Routing tier and profile configuration types.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A routing tier — a named combination of backend + model.
@@ -19,6 +21,37 @@ pub struct TierConfig {
     /// `true` enables it (slower but deeper reasoning). Absent = no injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+}
+
+/// A routing rule evaluated against semantic classification tags.
+///
+/// Rules are sorted by `priority` descending and evaluated in order. The first
+/// rule whose `when` map is a subset of the request's classification tags wins.
+///
+/// **Config example**
+/// ```toml
+/// [[profiles.default.rules]]
+/// when     = { intent = "greeting" }
+/// route_to = "local:instant"
+/// priority = 30
+///
+/// [[profiles.default.rules]]
+/// when     = { intent = "command", domain = "home" }
+/// route_to = "local:fast"
+/// priority = 20
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RuleConfig {
+    /// All key=value pairs in this map must match the classifier's tags for the
+    /// rule to fire. Matching is case-insensitive.
+    pub when: HashMap<String, String>,
+
+    /// Tier name (or alias) to route to when this rule matches.
+    pub route_to: String,
+
+    /// Evaluation order: higher priority rules are checked first. Default: 0.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 /// Routing profile — controls routing behaviour for a client.
@@ -73,6 +106,16 @@ pub struct ProfileConfig {
     /// ```
     #[serde(default)]
     pub system_prompt: Option<String>,
+
+    /// Tag-based routing rules evaluated before tier resolution in `classify` mode.
+    ///
+    /// Rules are sorted by `priority` descending. The first rule whose `when` tags
+    /// are all present in the classifier's response wins and the request is dispatched
+    /// directly to `route_to`, bypassing normal tier-ladder resolution.
+    ///
+    /// An empty (or absent) `rules` list leaves behaviour identical to no-rules mode.
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
 }
 
 /// Default classification prompt injected as the system message for `classify` mode.

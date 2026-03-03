@@ -154,6 +154,24 @@ classifier         = "local:fast"   # tier used for the pre-flight classificatio
 max_auto_tier      = "cloud:expert" # ceiling tier; exclude cloud:expert to cap at cloud:deep
 # classifier_prompt = "..."         # override the built-in classification prompt (v16, 27/27 on 27-case HA benchmark)
 # system_prompt     = "..."         # prepended to every request forwarded through this profile
+#
+# Semantic tag rules (classify mode only).
+# The classifier can emit structured tags alongside the tier label, e.g.:
+#   "tier=fast intent=greeting domain=home"
+# Rules are sorted by `priority` descending; the first rule whose `when` map is
+# a full subset of the classifier's tags wins. Matched rules bypass tier-ladder
+# resolution entirely and route directly to `route_to`. An absent or empty rules
+# list leaves behaviour identical to plain classify mode.
+#
+# [[profiles.auto.rules]]
+# when     = { intent = "greeting" }
+# route_to = "local:instant"
+# priority = 30
+#
+# [[profiles.auto.rules]]
+# when     = { intent = "command", domain = "home" }
+# route_to = "local:fast"
+# priority = 20
 
 # Home Assistant smart-routing profile.
 # Exposes as model "ha-auto" in /api/tags — point HA's Ollama integration here.

@@ -37,7 +37,8 @@ mod profile;
 // Re-exported for downstream code that matches on BackendConfig::api_key_secret.
 #[allow(unused_imports)]
 pub use gateway::{BackendConfig, GatewayConfig, SecretSource};
-pub use profile::{DEFAULT_CLASSIFIER_PROMPT, ProfileConfig, RoutingMode, TierConfig};
+#[allow(unused_imports)]
+pub use profile::{DEFAULT_CLASSIFIER_PROMPT, ProfileConfig, RuleConfig, RoutingMode, TierConfig};
 
 /// Which API protocol a backend speaks.
 ///
@@ -385,6 +386,7 @@ mod tests {
                 rate_limit_rpm: None,
                 classifier_prompt: None,
                 system_prompt: None,
+                rules: vec![],
             },
         );
         assert!(config.validate().is_err());

@@ -309,6 +309,7 @@ mod tests {
                         rate_limit_rpm: None,
                         classifier_prompt: None,
                         system_prompt: None,
+                        rules: vec![],
                     },
                 );
                 m

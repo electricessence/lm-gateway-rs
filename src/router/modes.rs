@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     RouterState,
-    classify::{parse_classification_label, resolve_tier_by_label},
+    classify::{parse_classification, ParsedClassification, resolve_tier_by_label},
 };
 
 /// Resolve the model hint in the request body to a concrete [`TierConfig`].
@@ -334,17 +334,48 @@ pub(super) async fn classify_and_dispatch(
     });
 
     let client = BackendClient::new(&backend_cfg)?;
-    let (label, think_override) = match client.classify(classifier_body).await {
-        Ok(response) => {
-            let parsed = parse_classification_label(&response);
-            debug!(label = %parsed.0, think_override = ?parsed.1, "classified request");
-            parsed
+    let ParsedClassification { tier_label: label, think_override, tags } =
+        match client.classify(classifier_body).await {
+            Ok(response) => {
+                let parsed = parse_classification(&response);
+                debug!(
+                    label = %parsed.tier_label,
+                    think_override = ?parsed.think_override,
+                    tags = ?parsed.tags,
+                    "classified request"
+                );
+                parsed
+            }
+            Err(e) => {
+                warn!(err = %e, "classification call failed — defaulting to first tier");
+                ParsedClassification { tier_label: "instant".into(), ..Default::default() }
+            }
+        };
+
+    // Rule evaluation: sort by priority DESC, first match wins.
+    // A rule matches when every `when` key=value pair is present in `tags`
+    // (case-insensitive).  Matched rules bypass the normal tier ladder and
+    // route directly to `rule.route_to`.
+    let mut sorted_rules = profile.rules.clone();
+    sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    if let Some(rule) = sorted_rules.iter().find(|r| {
+        r.when.iter().all(|(k, v)| {
+            tags.get(k.as_str())
+                .map(|tv| tv.eq_ignore_ascii_case(v))
+                .unwrap_or(false)
+        })
+    }) {
+        debug!(route_to = %rule.route_to, "routing rule matched");
+        let rule_tier = config
+            .resolve_tier(&rule.route_to)
+            .with_context(|| format!("rule route_to `{}` not found in config", rule.route_to))?;
+        if let Some(t) = think_override {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("think".into(), Value::Bool(t));
+            }
         }
-        Err(e) => {
-            warn!(err = %e, "classification call failed — defaulting to first tier");
-            (String::from("instant"), None)
-        }
-    };
+        return dispatch(state, body, rule_tier, stream).await;
+    }
 
     // If the conversation contains a tool-result the model must synthesise
     // external data — don't send it to the cheapest tier.

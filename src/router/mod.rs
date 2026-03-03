@@ -464,7 +464,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use self::classify::{parse_classification_label, resolve_tier_by_label};
+    use self::classify::{parse_classification, parse_classification_label, resolve_tier_by_label};
     use self::modes::is_sufficient;
 
     // -----------------------------------------------------------------------
@@ -596,6 +596,7 @@ mod tests {
                         rate_limit_rpm: None,
                         classifier_prompt: None,
                         system_prompt: None,
+                        rules: vec![],
                     },
                 );
                 m
@@ -806,9 +807,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_label_missing_content_returns_empty() {
+    fn parse_label_missing_content_falls_back_to_instant() {
+        // Missing or empty classifier content now returns "instant" — the safe
+        // lowest-cost tier — rather than an empty string that requires callers
+        // to handle the edge case themselves.
         let (label, think) = parse_classification_label(&json!({}));
-        assert_eq!(label, "");
+        assert_eq!(label, "instant");
         assert!(think.is_none());
     }
 
@@ -928,5 +932,80 @@ mod tests {
         let mut body = json!({"model": "foo"});
         inject_system_prompt(&mut body, "prompt");
         assert!(body.get("messages").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_classification — structured and legacy formats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_classification_legacy_single_token() {
+        let r = json!({"choices": [{"message": {"content": "fast"}}]});
+        let p = parse_classification(&r);
+        assert_eq!(p.tier_label, "fast");
+        assert!(p.think_override.is_none());
+        assert!(p.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_classification_structured_extracts_all_tags() {
+        let r = json!({"choices": [{"message": {"content": "tier=fast intent=greeting domain=home"}}]});
+        let p = parse_classification(&r);
+        assert_eq!(p.tier_label, "fast");
+        assert!(p.think_override.is_none());
+        assert_eq!(p.tags.get("intent").map(String::as_str), Some("greeting"));
+        assert_eq!(p.tags.get("domain").map(String::as_str), Some("home"));
+    }
+
+    #[test]
+    fn parse_classification_tier_key_wins_over_bare_tokens() {
+        // Even if there is a bare token before `tier=`, the explicit key wins.
+        let r = json!({"choices": [{"message": {"content": "deep tier=fast"}}]});
+        let p = parse_classification(&r);
+        assert_eq!(p.tier_label, "fast", "tier= key should override bare token");
+    }
+
+    #[test]
+    fn parse_classification_think_suffix_in_structured() {
+        let r = json!({"choices": [{"message": {"content": "tier=deep-think intent=analysis"}}]});
+        let p = parse_classification(&r);
+        assert_eq!(p.tier_label, "deep");
+        assert_eq!(p.think_override, Some(true));
+        assert_eq!(p.tags.get("intent").map(String::as_str), Some("analysis"));
+    }
+
+    #[test]
+    fn parse_classification_missing_tier_key_uses_first_bare_token() {
+        let r = json!({"choices": [{"message": {"content": "deep intent=analysis"}}]});
+        let p = parse_classification(&r);
+        assert_eq!(p.tier_label, "deep");
+        assert_eq!(p.tags.get("intent").map(String::as_str), Some("analysis"));
+    }
+
+    #[test]
+    fn parse_classification_empty_response_defaults_to_instant() {
+        let p = parse_classification(&json!({}));
+        assert_eq!(p.tier_label, "instant");
+        assert!(p.think_override.is_none());
+        assert!(p.tags.is_empty());
+    }
+
+    #[test]
+    fn parse_classification_label_delegates_to_parse_classification() {
+        // Ensure the backward-compat wrapper produces the same label/think as
+        // parse_classification for both legacy and structured inputs.
+        let cases = [
+            "fast",
+            "deep-think",
+            "tier=fast intent=greeting",
+            "tier=deep-think domain=work",
+        ];
+        for content in cases {
+            let r = json!({"choices": [{"message": {"content": content}}]});
+            let p = parse_classification(&r);
+            let (label, think) = parse_classification_label(&r);
+            assert_eq!(label, p.tier_label, "content: {content}");
+            assert_eq!(think, p.think_override, "content: {content}");
+        }
     }
 }
