@@ -130,6 +130,10 @@ impl OllamaAdapter {
         if let Some(obj) = body.as_object_mut() {
             obj.entry("keep_alive").or_insert(serde_json::json!(-1));
             obj.insert("stream".into(), serde_json::json!(false));
+            // Thinking mode causes Qwen3 to emit Python-style plain-text function
+            // calls instead of structured tool_calls JSON.  Tool dispatch is a
+            // structured lookup, not a reasoning task — force it off unconditionally.
+            obj.insert("think".into(), serde_json::json!(false));
         }
 
         let model = body
