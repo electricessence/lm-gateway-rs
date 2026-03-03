@@ -136,6 +136,7 @@ Examples:
   Good evening                     ->  class=greeting
   Tell me a joke                   ->  class=chitchat
   What's the capital of France?    ->  class=chitchat
+  What's the capital of Brazil?    ->  class=chitchat
   Turn on the light                ->  class=command
   Turn off the fan                 ->  class=command
   Lock up                          ->  class=command
@@ -152,6 +153,7 @@ Examples:
   Is the garage door open?         ->  class=inquiry
   Are all the doors locked?        ->  class=inquiry
   What lights are still on?        ->  class=inquiry
+  What is the garage door's state? ->  class=inquiry
 
 Reply with ONLY the tag. No explanation.\
 """
