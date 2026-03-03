@@ -186,6 +186,15 @@ when     = { class = "other" }
 route_to = "local:deep"
 priority = 10
 
+# Per-class framing nudges — prepended to system_prompt before dispatch.
+# command/other intentionally omitted: system_prompt covers commands;
+# deep model handles "other" without extra framing.
+[profiles.ha-auto.class_prompts]
+greeting     = "Respond warmly. Keep it to one sentence."
+chitchat     = "Answer briefly from general knowledge."
+conversation = "The user is continuing a prior exchange."
+inquiry      = "Query the device state and answer in one sentence."
+
 system_prompt = """\
 You are a Home Assistant voice controller. Execute commands via tools; confirm briefly.
 
