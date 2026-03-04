@@ -1,7 +1,7 @@
 #Requires -Version 7
 [CmdletBinding()]
 param(
-    [string]$Base       = 'http://10.10.80.20:8080',
+    [string]$Base       = ($env:LM_GATEWAY_URL ?? 'http://localhost:8080'),
     [string]$ClientKey  = $env:LMG_CLIENT_KEY   # optional — omit if gateway has no client auth
 )
 $ErrorActionPreference = 'Stop'

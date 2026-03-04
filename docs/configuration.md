@@ -306,7 +306,7 @@ Help the user with smart home queries, automations, and troubleshooting.
 """
 ```
 
-`class_prompts` (if set) **replaces** the profile `system_prompt` for that class — they are not concatenated.
+`class_prompts` (if set) is **prepended** to the profile `system_prompt` for that class — the class-specific text takes higher precedence, with the profile prompt following as shared baseline.
 
 ---
 

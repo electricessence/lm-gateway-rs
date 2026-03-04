@@ -86,7 +86,7 @@ pub(super) fn classify_and_resolve<'a>(
             return Ok(RoutingResolution {
                 tier_name: classifier_tier.name.clone(),
                 think_override: None,
-                class_label: "instant".to_owned(),
+                class_label: String::new(), // no classification performed — skip class_prompts
                 profile_chain: visited,
             });
         };
@@ -135,18 +135,21 @@ pub(super) fn classify_and_resolve<'a>(
                 }
             };
 
-        // Rule evaluation: sort by priority DESC, first match wins.
+        // Rule evaluation: sort by priority DESC, first non-cyclic match wins.
         // A rule matches when every `when` key=value pair is present in `tags`.
+        // Cyclic cascade rules are skipped and lower-priority rules are tried.
+        let class_label: String = tags.get("class").cloned().unwrap_or_else(|| label.clone());
         let mut sorted_rules = profile.rules.clone();
         sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
 
-        if let Some(rule) = sorted_rules.iter().find(|r| {
-            r.when.iter().all(|(k, v)| {
+        for rule in &sorted_rules {
+            if !rule.when.iter().all(|(k, v)| {
                 tags.get(k.as_str())
                     .map(|tv| tv.eq_ignore_ascii_case(v))
                     .unwrap_or(false)
-            })
-        }) {
+            }) {
+                continue; // rule doesn't match tags
+            }
             debug!(profile = %profile_name, route_to = %rule.route_to, "routing rule matched");
 
             if config.profiles.contains_key(&rule.route_to) {
@@ -155,19 +158,17 @@ pub(super) fn classify_and_resolve<'a>(
                     warn!(
                         profile = %profile_name,
                         route_to = %rule.route_to,
-                        "cascade cycle at runtime — skipping rule, falling back to label-based tier"
+                        "cascade cycle at runtime — skipping cyclic rule, trying lower-priority rules"
                     );
-                    // fall through to label-based resolution below
-                } else {
-                    let mut next_visited = visited.clone();
-                    next_visited.push(rule.route_to.clone());
-                    let target_name = rule.route_to.clone();
-                    debug!(cascade_to = %target_name, chain = ?next_visited, "cascading to profile");
-                    let inner =
-                        classify_and_resolve(state, body, &target_name, next_visited).await?;
-                    // profile_chain already contains the full traversal (seeded via next_visited).
-                    return Ok(inner);
+                    continue; // skip this rule; lower-priority rules may still match safely
                 }
+                let mut next_visited = visited.clone();
+                next_visited.push(rule.route_to.clone());
+                let target_name = rule.route_to.clone();
+                debug!(cascade_to = %target_name, chain = ?next_visited, "cascading to profile");
+                let inner =
+                    classify_and_resolve(state, body, &target_name, next_visited).await?;
+                return Ok(inner);
             } else {
                 // route_to is a tier name or alias — dispatch directly.
                 let rule_tier = config
@@ -176,13 +177,13 @@ pub(super) fn classify_and_resolve<'a>(
                 return Ok(RoutingResolution {
                     tier_name: rule_tier.name.clone(),
                     think_override,
-                    class_label: label,
+                    class_label: class_label.clone(),
                     profile_chain: visited,
                 });
             }
         }
 
-        // No rule matched (or cycle was skipped) — resolve tier from the label.
+        // No rule matched (or all matching rules were cyclic) — resolve tier from the label.
         let has_tool_result = body
             .pointer("/messages")
             .and_then(Value::as_array)
@@ -207,7 +208,7 @@ pub(super) fn classify_and_resolve<'a>(
         Ok(RoutingResolution {
             tier_name: target_tier.name.clone(),
             think_override,
-            class_label: label,
+            class_label,
             profile_chain: visited,
         })
     })

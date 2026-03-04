@@ -130,8 +130,9 @@ pub struct ProfileConfig {
     /// returned by the classifier (e.g. `"command"`, `"inquiry"`, `"greeting"`).
     ///
     /// When the classifier assigns a label, the matching prompt is prepended to the
-    /// request's system message immediately before dispatch — after the profile-level
-    /// `system_prompt`. Enables per-intent framing without duplicating the main prompt.
+    /// request's system message immediately before dispatch — ahead of the profile-level
+    /// `system_prompt` (so the class-specific text takes higher precedence).
+    /// Enables per-intent framing without duplicating the main prompt.
     ///
     /// ```toml
     /// [profiles.ha-auto.class_prompts]

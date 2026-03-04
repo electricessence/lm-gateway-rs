@@ -15,7 +15,7 @@
     The entity list and HA tool definitions are embedded so responses reflect
     a real HA session (model will produce tool_calls for commands).
 .PARAMETER Base
-    Gateway base URL. Default: http://10.10.80.20:8080
+    Gateway base URL. Defaults to $env:LM_GATEWAY_URL, then http://localhost:8080.
 .PARAMETER ClientKey
     Optional bearer token. Leave blank if gateway has no client auth.
 .PARAMETER TimeoutSec
@@ -27,7 +27,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Base      = 'http://10.10.80.20:8080',
+    [string]$Base      = ($env:LM_GATEWAY_URL ?? 'http://localhost:8080'),
     [string]$ClientKey = $env:LMG_CLIENT_KEY,
     [int]   $TimeoutSec = 90
 )
