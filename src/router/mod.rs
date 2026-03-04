@@ -26,17 +26,16 @@ use std::{
 
 use anyhow::Context;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     api::rate_limit::RateLimiter,
     backends::{BackendClient, SseStream},
-    config::{Config, RoutingMode, DEFAULT_CLASSIFIER_PROMPT},
+    config::{Config, RoutingMode},
     traffic::{TrafficEntry, TrafficLog},
 };
 
-use self::classify::{parse_classification_label, resolve_tier_by_label};
-use self::modes::{classify_and_dispatch, dispatch, escalate, resolve_target_tier};
+use self::modes::{classify_and_dispatch, classify_and_resolve, dispatch, escalate, resolve_target_tier};
 
 mod classify;
 mod modes;
@@ -204,7 +203,7 @@ pub async fn route(
             escalate(state, &mut request_body, profile, stream).await?
         }
         RoutingMode::Classify => {
-            classify_and_dispatch(state, &mut request_body, profile, stream).await?
+            classify_and_dispatch(state, &mut request_body, profile_name, stream).await?
         }
     };
 
@@ -258,100 +257,37 @@ pub async fn route_stream(
         inject_system_prompt(&mut request_body, prompt);
     }
 
-    // In classify mode, run a non-streaming classification call first to pick
-    // the best tier, then stream from that tier instead of the resolved one.
-    let target_tier_name: String = if profile.mode == RoutingMode::Classify {
-        let classifier_tier = config
-            .tiers
-            .iter()
-            .find(|t| t.name == profile.classifier)
-            .context("classifier tier not found in config")?;
-
-        let backend_cfg = config
-            .backends
-            .get(&classifier_tier.backend)
-            .with_context(|| format!("backend `{}` not in config", classifier_tier.backend))?
-            .clone();
-
-        let user_text = request_body
-            .pointer("/messages")
-            .and_then(Value::as_array)
-            .and_then(|arr| {
-                arr.iter()
-                    .rev()
-                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            })
-            .and_then(|m| m.get("content").and_then(Value::as_str))
-            .map(|s| s.to_owned());
-
-        if let Some(user_text) = user_text {
-            let system_prompt = profile
-                .classifier_prompt
-                .as_deref()
-                .unwrap_or(DEFAULT_CLASSIFIER_PROMPT);
-
-            let max_idx = config
-                .tiers
-                .iter()
-                .position(|t| t.name == profile.max_auto_tier)
-                .unwrap_or(config.tiers.len().saturating_sub(1));
-            let candidates = &config.tiers[..=max_idx];
-            let n = candidates.len();
-
-            let classifier_body = serde_json::json!({
-                "model": classifier_tier.model,
-                "messages": [
-                    { "role": "system", "content": system_prompt },
-                    { "role": "user",   "content": &user_text   }
-                ],
-                "stream": false,
-                "think": false,
-                // num_predict and temperature go in options for Ollama native /api/chat.
-                "options": { "num_predict": 5, "temperature": 0 }
-            });
-
-            let client = BackendClient::new(&backend_cfg)?;
-            let (label, think_override) = match client.classify(classifier_body).await {
-                Ok(r) => {
-                    let parsed = parse_classification_label(&r);
-                    debug!(label = %parsed.0, think_override = ?parsed.1, "stream classify resolved");
-                    parsed
+    // In classify mode, run a non-streaming pre-flight call through classify_and_resolve,
+    // which handles rule evaluation and profile cascade routing, then stream from the
+    // resolved tier.  This path now shares all routing logic with the non-streaming path.
+    let (target_tier_name, routing_trace): (String, Option<(String, Vec<String>)>) =
+        if profile.mode == RoutingMode::Classify {
+            let visited = vec![profile_name.to_owned()];
+            let resolution = classify_and_resolve(state, &request_body, profile_name, visited).await?;
+            // Apply per-class system prompt from the final profile in the cascade chain.
+            let final_profile_name = resolution.profile_chain.last().map(String::as_str).unwrap_or(profile_name);
+            if let Some(final_profile) = config.profiles.get(final_profile_name) {
+                if let Some(class_prompt) = final_profile.class_prompts.get(resolution.class_label.as_str()) {
+                    inject_system_prompt(&mut request_body, class_prompt);
                 }
-                Err(e) => {
-                    warn!(err = %e, "stream classify call failed — defaulting to first tier");
-                    (String::from("instant"), None)
-                }
-            };
-
-            let has_tool_result = request_body
-                .pointer("/messages")
-                .and_then(Value::as_array)
-                .map(|arr| arr.iter().any(|m| {
-                    m.get("role").and_then(Value::as_str) == Some("tool")
-                }))
-                .unwrap_or(false);
-
-            let mut target_tier = resolve_tier_by_label(&label, candidates);
-            if has_tool_result && std::ptr::eq(target_tier, &candidates[0]) && n > 1 {
-                debug!("tool-result — bumping from cheapest tier to next");
-                target_tier = &candidates[1];
             }
-
             // Inject think override before streaming dispatch.
-            if let Some(t) = think_override {
+            if let Some(t) = resolution.think_override {
                 if let Some(obj) = request_body.as_object_mut() {
                     obj.insert("think".into(), Value::Bool(t));
                 }
             }
-
-            debug!(label = %label, tier = %target_tier.name, "stream classify resolved");
-            target_tier.name.clone()
+            debug!(
+                tier = %resolution.tier_name,
+                label = %resolution.class_label,
+                chain = ?resolution.profile_chain,
+                "stream classify resolved"
+            );
+            let trace = (resolution.class_label, resolution.profile_chain);
+            (resolution.tier_name, Some(trace))
         } else {
-            classifier_tier.name.clone()
-        }
-    } else {
-        resolved_tier.name.clone()
-    };
+            (resolved_tier.name.clone(), None)
+        };
 
     let target_tier = config
         .tiers
@@ -416,6 +352,9 @@ pub async fn route_stream(
     if let Some(id) = request_id {
         entry = entry.with_id(id);
     }
+    if let Some((class_label, profile_chain)) = routing_trace {
+        entry = entry.with_routing_trace(class_label, profile_chain);
+    }
 
     state.traffic.push(entry.clone());
 
@@ -432,7 +371,7 @@ pub async fn route_stream(
 /// placed before its content (separated by `\n\n`), so client-provided context
 /// is preserved while the profile's instructions take precedence.
 /// If there is no existing system message, one is inserted at index 0.
-fn inject_system_prompt(body: &mut Value, prompt: &str) {
+pub(super) fn inject_system_prompt(body: &mut Value, prompt: &str) {
     let Some(messages) = body.pointer_mut("/messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -595,8 +534,10 @@ mod tests {
                         expert_requires_flag: false,
                         rate_limit_rpm: None,
                         classifier_prompt: None,
+                        classifier_think: None,
                         system_prompt: None,
                         rules: vec![],
+                        ..Default::default()
                     },
                 );
                 m

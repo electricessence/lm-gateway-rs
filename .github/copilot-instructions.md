@@ -77,4 +77,4 @@ Full PowerShell quality standards → `.github/instructions/powershell.instructi
 
 See `.github/instructions/phased-commit.instructions.md` for the full procedure.
 
-**Summary:** Stage → Critical Review → Security Audit → Commit → **await explicit push approval**.
+**Summary:** Stage → Critical Review → Security Audit → Commit → **await explicit push approval** → request fresh Copilot review if resolving PR comments.

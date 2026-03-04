@@ -23,3 +23,5 @@ Any hit: remove it and restart from 1 before committing.
 **4 Commit** --- present-tense message (`Add X`, `Fix Y`, `Update Z`). Commit locally.
 
 **5 Push - EXPLICIT APPROVAL REQUIRED** --- always get approval before `git push`; report commit + concerns and wait for confirmation.
+
+**6 PR Quality Loop** --- if this push resolves comments on an open PR, immediately request a fresh Copilot review. A new review catches anything the first pass missed or any regressions introduced by the fix. Do not skip this step.

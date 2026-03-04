@@ -178,6 +178,46 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+/// Validate that no profile cascade `route_to` chain forms a cycle.
+///
+/// DFS from every profile's rule `route_to` targets that are themselves
+/// profiles.  Fails at the first detected cycle with a readable path trace,
+/// e.g. `"circular profile cascade: auto → code-auto → auto"`.
+fn validate_profile_route_cycles(
+    profiles: &std::collections::HashMap<String, ProfileConfig>,
+) -> anyhow::Result<()> {
+    for start in profiles.keys() {
+        let mut path: Vec<&str> = vec![start.as_str()];
+        dfs_profile_routes(profiles, start, &mut path)?;
+    }
+    Ok(())
+}
+
+/// Recursive DFS helper for [`validate_profile_route_cycles`].
+fn dfs_profile_routes<'a>(
+    profiles: &'a std::collections::HashMap<String, ProfileConfig>,
+    current: &str,
+    path: &mut Vec<&'a str>,
+) -> anyhow::Result<()> {
+    let Some(profile) = profiles.get(current) else {
+        return Ok(());
+    };
+    for rule in &profile.rules {
+        if !profiles.contains_key(&rule.route_to) {
+            continue; // route_to is a tier — no cycle risk here
+        }
+        if let Some(cycle_start) = path.iter().position(|&p| p == rule.route_to.as_str()) {
+            let mut cycle: Vec<&str> = path[cycle_start..].to_vec();
+            cycle.push(rule.route_to.as_str());
+            anyhow::bail!("circular profile cascade: {}", cycle.join(" → "));
+        }
+        path.push(rule.route_to.as_str());
+        dfs_profile_routes(profiles, &rule.route_to, path)?;
+        path.pop();
+    }
+    Ok(())
+}
+
 impl Config {
     /// Load configuration from `path`, then layer any `*.toml` files found in
     /// a `conf.d/` directory sitting next to `path` (alphabetically ordered).
@@ -229,9 +269,18 @@ impl Config {
 
         // Serialize back to string and use toml::from_str exclusively (see gotchas.md).
         let merged = toml::to_string(&base).context("re-serializing merged config")?;
-        let config: Self = toml::from_str(&merged).context("deserializing merged config")?;
+        let mut config: Self = toml::from_str(&merged).context("deserializing merged config")?;
+        config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Sort rules within each profile by priority descending so that rule
+    /// evaluation in the hot path can iterate without re-sorting on every request.
+    fn normalize(&mut self) {
+        for profile in self.profiles.values_mut() {
+            profile.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        }
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -278,6 +327,9 @@ impl Config {
                 client.profile
             );
         }
+
+        // Profile cascade routes must not form cycles
+        validate_profile_route_cycles(&self.profiles)?;
 
         Ok(())
     }
@@ -385,8 +437,10 @@ mod tests {
                 expert_requires_flag: false,
                 rate_limit_rpm: None,
                 classifier_prompt: None,
+                classifier_think: None,
                 system_prompt: None,
                 rules: vec![],
+                ..Default::default()
             },
         );
         assert!(config.validate().is_err());
@@ -709,5 +763,86 @@ max_auto_tier = "local:fast"
         assert_eq!(config.gateway.client_port, 8080);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile cascade cycle detection
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal ProfileConfig with a single cascade rule for testing.
+    fn cascade_profile(classifier: &str, max_auto_tier: &str, route_to: &str) -> ProfileConfig {
+        toml::from_str(&format!(
+            r#"
+            mode          = "classify"
+            classifier    = "{classifier}"
+            max_auto_tier = "{max_auto_tier}"
+
+            [[rules]]
+            when     = {{ intent = "test" }}
+            route_to = "{route_to}"
+            priority = 10
+            "#
+        ))
+        .expect("cascade_profile: parse failed")
+    }
+
+    #[test]
+    fn no_cycle_passes_validation() {
+        // auto → ha-auto (linear, no cycle)
+        let mut profiles = HashMap::new();
+        profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "ha-auto"));
+        profiles.insert("ha-auto".into(), cascade_profile("local:fast", "local:fast", "local:fast"));
+        assert!(validate_profile_route_cycles(&profiles).is_ok());
+    }
+
+    #[test]
+    fn direct_self_cycle_is_rejected() {
+        // auto → auto (self-loop)
+        let mut profiles = HashMap::new();
+        profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "auto"));
+        let err = validate_profile_route_cycles(&profiles).unwrap_err();
+        assert!(err.to_string().contains("circular profile cascade"), "{err}");
+    }
+
+    #[test]
+    fn two_hop_cycle_is_rejected() {
+        // auto → ha-auto → auto
+        let mut profiles = HashMap::new();
+        profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "ha-auto"));
+        profiles.insert("ha-auto".into(), cascade_profile("local:fast", "local:fast", "auto"));
+        let err = validate_profile_route_cycles(&profiles).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("circular profile cascade"), "{msg}");
+        assert!(msg.contains("auto"), "{msg}");
+        assert!(msg.contains("ha-auto"), "{msg}");
+    }
+
+    #[test]
+    fn three_hop_cascade_without_cycle_passes() {
+        // auto → ha-auto → ha-inquiry (three profiles, no cycle)
+        let mut profiles = HashMap::new();
+        profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "ha-auto"));
+        profiles.insert("ha-auto".into(), cascade_profile("local:fast", "local:fast", "ha-inquiry"));
+        profiles.insert("ha-inquiry".into(), cascade_profile("local:fast", "local:fast", "local:fast"));
+        assert!(validate_profile_route_cycles(&profiles).is_ok());
+    }
+
+    #[test]
+    fn three_hop_cycle_is_rejected() {
+        // auto → ha-auto → ha-inquiry → auto
+        let mut profiles = HashMap::new();
+        profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "ha-auto"));
+        profiles.insert("ha-auto".into(), cascade_profile("local:fast", "local:fast", "ha-inquiry"));
+        profiles.insert("ha-inquiry".into(), cascade_profile("local:fast", "local:fast", "auto"));
+        let err = validate_profile_route_cycles(&profiles).unwrap_err();
+        assert!(err.to_string().contains("circular profile cascade"), "{err}");
+    }
+
+    #[test]
+    fn tier_route_to_is_ignored_by_cycle_check() {
+        // route_to = "local:fast" is a tier, not a profile — must not be flagged
+        let mut profiles = HashMap::new();
+        profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "local:fast"));
+        assert!(validate_profile_route_cycles(&profiles).is_ok());
     }
 }

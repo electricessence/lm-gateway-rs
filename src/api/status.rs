@@ -138,8 +138,10 @@ mod tests {
                         expert_requires_flag: false,
                         rate_limit_rpm: None,
                         classifier_prompt: None,
+                        classifier_think: None,
                         system_prompt: None,
                         rules: vec![],
+                        ..Default::default()
                     },
                 );
                 m

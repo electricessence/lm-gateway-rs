@@ -141,24 +141,27 @@ pub async fn chat_completions_ollama(
         )
         .await
         {
-            Ok((stream, _entry, is_native)) => {
-                if is_native {
+            Ok((stream, entry, is_native)) => {
+                let mut response = if is_native {
                     // Native NDJSON from /api/chat — passthrough directly.
-                    return Ok(axum::response::Response::builder()
+                    axum::response::Response::builder()
                         .header("content-type", "application/x-ndjson")
                         .header("cache-control", "no-cache")
                         .header("x-accel-buffering", "no")
                         .body(Body::from_stream(stream))
-                        .expect("ollama_chat: failed to build native ndjson response"));
-                }
-                // Translate OpenAI SSE stream → Ollama NDJSON stream.
-                let ndjson = sse_to_ollama_ndjson(model_name.clone(), stream);
-                return Ok(axum::response::Response::builder()
-                    .header("content-type", "application/x-ndjson")
-                    .header("cache-control", "no-cache")
-                    .header("x-accel-buffering", "no")
-                    .body(Body::from_stream(ndjson))
-                    .expect("ollama_chat: failed to build streaming response"));
+                        .expect("ollama_chat: failed to build native ndjson response")
+                } else {
+                    // Translate OpenAI SSE stream → Ollama NDJSON stream.
+                    let ndjson = sse_to_ollama_ndjson(model_name.clone(), stream);
+                    axum::response::Response::builder()
+                        .header("content-type", "application/x-ndjson")
+                        .header("cache-control", "no-cache")
+                        .header("x-accel-buffering", "no")
+                        .body(Body::from_stream(ndjson))
+                        .expect("ollama_chat: failed to build streaming response")
+                };
+                super::inject_routing_headers(response.headers_mut(), &entry, &state.config());
+                return Ok(response);
             }
             Err(e) => return Ok(Json(super::error_ollama_response(&e, &model_name)).into_response()),
         }
@@ -166,7 +169,7 @@ pub async fn chat_completions_ollama(
 
     // Non-streaming path: route and convert response.
     openai_body["stream"] = json!(false);
-    let response = match crate::router::route(
+    let (openai_response, entry) = match crate::router::route(
         &state,
         openai_body,
         effective_profile,
@@ -176,9 +179,10 @@ pub async fn chat_completions_ollama(
     )
     .await
     {
-        Ok((r, _entry)) => r,
+        Ok((r, e)) => (r, e),
         Err(e) => return Ok(Json(super::error_ollama_response(&e, &model_name)).into_response()),
     };
+    let response = openai_response;
 
     let model_name = model_name.as_str();
     let choice_message = response.pointer("/choices/0/message");
@@ -237,7 +241,9 @@ pub async fn chat_completions_ollama(
         "eval_count":         eval_count
     });
 
-    Ok(Json(ollama_response).into_response())
+    let mut response = Json(ollama_response).into_response();
+    super::inject_routing_headers(response.headers_mut(), &entry, &state.config());
+    Ok(response)
 }
 
 /// Translate an OpenAI SSE stream into an Ollama-compatible NDJSON stream.
