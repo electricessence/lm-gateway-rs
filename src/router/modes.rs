@@ -5,6 +5,7 @@
 //! resolved.  [`is_sufficient`] is the heuristic that drives escalation.
 
 use anyhow::Context;
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -18,6 +19,200 @@ use super::{
     RouterState,
     classify::{parse_classification, ParsedClassification, resolve_tier_by_label},
 };
+
+/// Outcome of a classify-mode routing pass.
+///
+/// Carries the resolved tier name, optional `think` override to inject before
+/// dispatch, the top-level classification label (for logging/trace headers), and
+/// the chain of profile names traversed — e.g. `["auto", "ha-auto"]` for a
+/// two-hop cascade.
+pub(super) struct RoutingResolution {
+    pub tier_name: String,
+    pub think_override: Option<bool>,
+    pub class_label: String,
+    pub profile_chain: Vec<String>,
+}
+
+/// Classify a request against the named profile and resolve it to a concrete tier.
+///
+/// Supports **profile cascade routing**: when a matched rule's `route_to` names
+/// another profile (rather than a tier name or alias), this function recurses
+/// into that profile's classifier and rule set.  The `visited` list prevents
+/// infinite loops at runtime — a static DFS at config-load catches any declared
+/// cycles before the server starts.
+///
+/// Called by [`classify_and_dispatch`] for the non-streaming path and directly
+/// from `route_stream` for the streaming path so both share identical routing
+/// logic.
+pub(super) fn classify_and_resolve<'a>(
+    state: &'a RouterState,
+    body: &'a Value,
+    profile_name: &'a str,
+    visited: Vec<String>,
+) -> BoxFuture<'a, anyhow::Result<RoutingResolution>> {
+    Box::pin(async move {
+        let config = state.config();
+        let profile = config
+            .profiles
+            .get(profile_name)
+            .with_context(|| format!("profile `{profile_name}` not found in config"))?;
+
+        let classifier_tier = config
+            .tiers
+            .iter()
+            .find(|t| t.name == profile.classifier)
+            .context("classifier tier not found in config")?;
+
+        let backend_cfg = config
+            .backends
+            .get(&classifier_tier.backend)
+            .with_context(|| format!("backend `{}` not in config", classifier_tier.backend))?
+            .clone();
+
+        // Extract the last user message to classify.
+        let user_text = body
+            .pointer("/messages")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            })
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .map(|s| s.to_owned());
+
+        let Some(user_text) = user_text else {
+            debug!(profile = %profile_name, "no user message — bypassing classification");
+            return Ok(RoutingResolution {
+                tier_name: classifier_tier.name.clone(),
+                think_override: None,
+                class_label: "instant".to_owned(),
+                profile_chain: visited,
+            });
+        };
+
+        let system_prompt = profile
+            .classifier_prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_CLASSIFIER_PROMPT);
+
+        let max_idx = config
+            .tiers
+            .iter()
+            .position(|t| t.name == profile.max_auto_tier)
+            .unwrap_or(config.tiers.len().saturating_sub(1));
+        let candidates: &[TierConfig] = &config.tiers[..=max_idx];
+
+        let classifier_think = profile.classifier_think.unwrap_or(false);
+        let classifier_body = serde_json::json!({
+            "model": classifier_tier.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user",   "content": &user_text   }
+            ],
+            "stream": false,
+            "think": classifier_think,
+            "options": { "num_predict": 10, "temperature": 0 }
+        });
+
+        let client = BackendClient::new(&backend_cfg)?;
+        let ParsedClassification { tier_label: label, think_override, tags } =
+            match client.classify(classifier_body).await {
+                Ok(response) => {
+                    let parsed = parse_classification(&response);
+                    debug!(
+                        profile = %profile_name,
+                        label = %parsed.tier_label,
+                        think_override = ?parsed.think_override,
+                        tags = ?parsed.tags,
+                        "classified request"
+                    );
+                    parsed
+                }
+                Err(e) => {
+                    warn!(err = %e, profile = %profile_name, "classification call failed — defaulting to first tier");
+                    ParsedClassification { tier_label: "instant".into(), ..Default::default() }
+                }
+            };
+
+        // Rule evaluation: sort by priority DESC, first match wins.
+        // A rule matches when every `when` key=value pair is present in `tags`.
+        let mut sorted_rules = profile.rules.clone();
+        sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        if let Some(rule) = sorted_rules.iter().find(|r| {
+            r.when.iter().all(|(k, v)| {
+                tags.get(k.as_str())
+                    .map(|tv| tv.eq_ignore_ascii_case(v))
+                    .unwrap_or(false)
+            })
+        }) {
+            debug!(profile = %profile_name, route_to = %rule.route_to, "routing rule matched");
+
+            if config.profiles.contains_key(&rule.route_to) {
+                // Cascade: route_to names a profile — recurse unless already visited.
+                if visited.contains(&rule.route_to) {
+                    warn!(
+                        profile = %profile_name,
+                        route_to = %rule.route_to,
+                        "cascade cycle at runtime — skipping rule, falling back to label-based tier"
+                    );
+                    // fall through to label-based resolution below
+                } else {
+                    let mut next_visited = visited.clone();
+                    next_visited.push(rule.route_to.clone());
+                    let target_name = rule.route_to.clone();
+                    debug!(cascade_to = %target_name, chain = ?next_visited, "cascading to profile");
+                    let mut inner =
+                        classify_and_resolve(state, body, &target_name, next_visited).await?;
+                    // Prepend current profile so callers see the full traversal path.
+                    inner.profile_chain.insert(0, profile_name.to_owned());
+                    return Ok(inner);
+                }
+            } else {
+                // route_to is a tier name or alias — dispatch directly.
+                let rule_tier = config
+                    .resolve_tier(&rule.route_to)
+                    .with_context(|| format!("rule route_to `{}` not found in config", rule.route_to))?;
+                return Ok(RoutingResolution {
+                    tier_name: rule_tier.name.clone(),
+                    think_override,
+                    class_label: label,
+                    profile_chain: visited,
+                });
+            }
+        }
+
+        // No rule matched (or cycle was skipped) — resolve tier from the label.
+        let has_tool_result = body
+            .pointer("/messages")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().any(|m| {
+                m.get("role").and_then(Value::as_str) == Some("tool")
+            }))
+            .unwrap_or(false);
+
+        let mut target_tier = resolve_tier_by_label(&label, candidates);
+        if has_tool_result && std::ptr::eq(target_tier, &candidates[0]) && candidates.len() > 1 {
+            debug!("tool-result — bumping from cheapest tier to next");
+            target_tier = &candidates[1];
+        }
+
+        debug!(
+            profile = %profile_name,
+            label = %label,
+            tier = %target_tier.name,
+            "classify routing resolved"
+        );
+
+        Ok(RoutingResolution {
+            tier_name: target_tier.name.clone(),
+            think_override,
+            class_label: label,
+            profile_chain: visited,
+        })
+    })
+}
 
 /// Resolve the model hint in the request body to a concrete [`TierConfig`].
 ///
@@ -255,159 +450,37 @@ pub(super) async fn escalate(
     anyhow::bail!("all tiers exhausted without a sufficient response")
 }
 
-/// Mode C: pre-flight classification call, then dispatch to the resolved tier.
+/// Mode C: pre-flight classification + cascade-aware routing, then dispatch.
 ///
-/// Extracts the last user message, makes a fast non-streaming inference call
-/// to the `classifier` tier with the configured prompt, parses the one-word
-/// label, and maps it to a tier from the profile's auto range:
+/// Delegates the classification and rule-evaluation to [`classify_and_resolve`],
+/// which handles profile cascade routing, then dispatches to the resolved tier.
 ///
-/// - `simple`   → `tiers[0]`     (cheapest)
-/// - `moderate` → `tiers[n / 2]` (middle)
-/// - `complex`  → `tiers[n - 1]` (most capable, bounded by `max_auto_tier`)
-///
-/// Falls back to the classifier tier itself if the classification call fails or
-/// there is no user message to classify.
+/// The `profile_name` parameter seeds the visited-set used for cascade cycle
+/// detection.  Pass the name of the profile being actively processed.
 pub(super) async fn classify_and_dispatch(
     state: &RouterState,
     body: &mut Value,
-    profile: &ProfileConfig,
+    profile_name: &str,
     stream: bool,
 ) -> anyhow::Result<(Value, TrafficEntry)> {
     let config = state.config();
-
-    // Find the classifier tier (used for the classification call).
-    let classifier_tier = config
-        .tiers
-        .iter()
-        .find(|t| t.name == profile.classifier)
-        .context("classifier tier not found in config")?;
-
-    let backend_cfg = config
-        .backends
-        .get(&classifier_tier.backend)
-        .with_context(|| format!("backend `{}` not in config", classifier_tier.backend))?
-        .clone();
-
-    // Extract the last user message to classify.
-    let user_text = body
-        .pointer("/messages")
-        .and_then(Value::as_array)
-        .and_then(|arr| {
-            arr.iter()
-                .rev()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        })
-        .and_then(|m| m.get("content").and_then(Value::as_str))
-        .map(|s| s.to_owned());
-
-    let Some(user_text) = user_text else {
-        debug!("no user message found — bypassing classification, using classifier tier");
-        return dispatch(state, body, classifier_tier, stream).await;
-    };
-
-    let system_prompt = profile
-        .classifier_prompt
-        .as_deref()
-        .unwrap_or(DEFAULT_CLASSIFIER_PROMPT);
-
-    // Build candidate tier slice (first tier up to max_auto_tier inclusive).
-    let max_idx = config
-        .tiers
-        .iter()
-        .position(|t| t.name == profile.max_auto_tier)
-        .unwrap_or(config.tiers.len().saturating_sub(1));
-    let candidates: &[TierConfig] = &config.tiers[..=max_idx];
-
-    // Make the classification call (non-streaming, max_tokens=10, temp=0).
-    let classifier_think = profile.classifier_think.unwrap_or(false);
-    let classifier_body = serde_json::json!({
-        "model": classifier_tier.model,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user",   "content": &user_text   }
-        ],
-        "stream": false,
-        "think": classifier_think,
-        // num_predict and temperature go in options for Ollama native /api/chat;
-        // max_tokens / temperature are OpenAI-compat fields that the native
-        // endpoint silently ignores.
-        "options": { "num_predict": 10, "temperature": 0 }
-    });
-
-    let client = BackendClient::new(&backend_cfg)?;
-    let ParsedClassification { tier_label: label, think_override, tags } =
-        match client.classify(classifier_body).await {
-            Ok(response) => {
-                let parsed = parse_classification(&response);
-                debug!(
-                    label = %parsed.tier_label,
-                    think_override = ?parsed.think_override,
-                    tags = ?parsed.tags,
-                    "classified request"
-                );
-                parsed
-            }
-            Err(e) => {
-                warn!(err = %e, "classification call failed — defaulting to first tier");
-                ParsedClassification { tier_label: "instant".into(), ..Default::default() }
-            }
-        };
-
-    // Rule evaluation: sort by priority DESC, first match wins.
-    // A rule matches when every `when` key=value pair is present in `tags`
-    // (case-insensitive).  Matched rules bypass the normal tier ladder and
-    // route directly to `rule.route_to`.
-    let mut sorted_rules = profile.rules.clone();
-    sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
-    if let Some(rule) = sorted_rules.iter().find(|r| {
-        r.when.iter().all(|(k, v)| {
-            tags.get(k.as_str())
-                .map(|tv| tv.eq_ignore_ascii_case(v))
-                .unwrap_or(false)
-        })
-    }) {
-        debug!(route_to = %rule.route_to, "routing rule matched");
-        let rule_tier = config
-            .resolve_tier(&rule.route_to)
-            .with_context(|| format!("rule route_to `{}` not found in config", rule.route_to))?;
-        if let Some(t) = think_override {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("think".into(), Value::Bool(t));
-            }
-        }
-        return dispatch(state, body, rule_tier, stream).await;
-    }
-
-    // If the conversation contains a tool-result the model must synthesise
-    // external data — don't send it to the cheapest tier.
-    let has_tool_result = body
-        .pointer("/messages")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().any(|m| {
-            m.get("role").and_then(Value::as_str) == Some("tool")
-        }))
-        .unwrap_or(false);
-
-    let mut target_tier = resolve_tier_by_label(&label, candidates);
-    if has_tool_result && std::ptr::eq(target_tier, &candidates[0]) && candidates.len() > 1 {
-        debug!("tool-result — bumping from cheapest tier to next");
-        target_tier = &candidates[1];
-    }
-
-    debug!(
-        label = %label,
-        tier = %target_tier.name,
-        "classify routing resolved"
-    );
+    let visited = vec![profile_name.to_owned()];
+    let resolution = classify_and_resolve(state, body, profile_name, visited).await?;
 
     // Inject think override before dispatching.
-    if let Some(t) = think_override {
+    if let Some(t) = resolution.think_override {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("think".into(), Value::Bool(t));
         }
     }
 
-    dispatch(state, body, target_tier, stream).await
+    let tier = config
+        .tiers
+        .iter()
+        .find(|t| t.name == resolution.tier_name)
+        .with_context(|| format!("resolved tier `{}` not found in config", resolution.tier_name))?;
+
+    dispatch(state, body, tier, stream).await
 }
 
 /// Decide whether a backend response is good enough to return or should be escalated.

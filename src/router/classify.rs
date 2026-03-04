@@ -82,6 +82,7 @@ pub(crate) fn parse_classification(response: &Value) -> ParsedClassification {
 /// identically.
 ///
 /// The `-think` suffix (e.g. `deep-think`) sets `think_override = Some(true)`.
+#[allow(dead_code)] // used in tests
 pub(crate) fn parse_classification_label(response: &Value) -> (String, Option<bool>) {
     let p = parse_classification(response);
     (p.tier_label, p.think_override)

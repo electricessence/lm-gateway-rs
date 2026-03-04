@@ -178,6 +178,46 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+/// Validate that no profile cascade `route_to` chain forms a cycle.
+///
+/// DFS from every profile's rule `route_to` targets that are themselves
+/// profiles.  Fails at the first detected cycle with a readable path trace,
+/// e.g. `"circular profile cascade: auto → code-auto → auto"`.
+fn validate_profile_route_cycles(
+    profiles: &std::collections::HashMap<String, ProfileConfig>,
+) -> anyhow::Result<()> {
+    for start in profiles.keys() {
+        let mut path: Vec<&str> = vec![start.as_str()];
+        dfs_profile_routes(profiles, start, &mut path)?;
+    }
+    Ok(())
+}
+
+/// Recursive DFS helper for [`validate_profile_route_cycles`].
+fn dfs_profile_routes<'a>(
+    profiles: &'a std::collections::HashMap<String, ProfileConfig>,
+    current: &str,
+    path: &mut Vec<&'a str>,
+) -> anyhow::Result<()> {
+    let Some(profile) = profiles.get(current) else {
+        return Ok(());
+    };
+    for rule in &profile.rules {
+        if !profiles.contains_key(&rule.route_to) {
+            continue; // route_to is a tier — no cycle risk here
+        }
+        if let Some(cycle_start) = path.iter().position(|&p| p == rule.route_to.as_str()) {
+            let mut cycle: Vec<&str> = path[cycle_start..].to_vec();
+            cycle.push(rule.route_to.as_str());
+            anyhow::bail!("circular profile cascade: {}", cycle.join(" → "));
+        }
+        path.push(rule.route_to.as_str());
+        dfs_profile_routes(profiles, &rule.route_to, path)?;
+        path.pop();
+    }
+    Ok(())
+}
+
 impl Config {
     /// Load configuration from `path`, then layer any `*.toml` files found in
     /// a `conf.d/` directory sitting next to `path` (alphabetically ordered).
@@ -278,6 +318,9 @@ impl Config {
                 client.profile
             );
         }
+
+        // Profile cascade routes must not form cycles
+        validate_profile_route_cycles(&self.profiles)?;
 
         Ok(())
     }
