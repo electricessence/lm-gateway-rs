@@ -186,12 +186,21 @@ This is additive and backward-compatible. Profiles without `route_to` pointing a
    ```
    This is the right place to catch misconfiguration — fail early, loud, and specifically.
 
-2. **Runtime depth guard (safety net):** even if static validation passes, track hop count on each request (max 8). If exceeded, return a 500 with the routing trace in the error body. Catches any cycles that arise from dynamic aliasing at request time.
+2. **Per-request visited set (runtime breadcrumbs):** each request carries the *set of profiles already traversed* in its routing path. Before re-entering a profile via `route_to`, check if that profile is already in the visited set. If so, skip the rule and continue to the next one (or fall through to tier-label routing).
+
+   This is stronger than a raw depth counter: it prevents any indirect cycle dynamically, and it gives a semantically clear error — `"auto" already in routing chain: auto → code-auto → auto`. It also naturally produces the `X-LMG-Profile` trace header as a side effect — the visited set *is* the routing breadcrumb trail.
+
+   Example flow for `auto → code-auto`:
+   1. Request enters `auto` — visited = `{auto}`
+   2. Rule matches `domain=code` → `route_to = "code-auto"` — `code-auto` not in visited → proceed
+   3. Request re-enters `code-auto` — visited = `{auto, code-auto}`
+   4. If any rule in `code-auto` points back to `auto` → skip (already visited)
+   5. Falls through to tier dispatch → `cloud:deep`
 
 **What changes in code (~80 lines new Rust):**
 
-- `config/mod.rs`: after loading all profiles, run a cycle check (DFS over the `route_to` → profile name graph); error out on startup if any cycle is found
-- `router/modes.rs`: add a `depth: u8` parameter to `classify_and_dispatch`; increment on each profile re-entry; return a routing-trace error if depth exceeds the limit
+- `config/mod.rs`: after loading all profiles, run a cycle check (DFS over the `route_to` → profile name graph); error out on startup if any input cycle is found
+- `router/modes.rs`: thread a `visited: HashSet<&str>` through `classify_and_dispatch`; insert profile name on entry; skip any `route_to` rule whose target is already in the set; populate `X-LMG-Profile` header from the set in traversal order
 - `config/profile.rs`: no change — profiles are already stored in a `HashMap<String, ProfileConfig>` accessible to the router
 
 ---
