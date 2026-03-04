@@ -177,9 +177,21 @@ complex : "Architect a full system", "Create an Excel formula with VBA"
 
 This is additive and backward-compatible. Profiles without `route_to` pointing at other profiles work exactly as today.
 
-**What changes in code (~50 lines new Rust):**
+**Cycle detection — two layers:**
 
-- `router/modes.rs`: in `classify_and_dispatch`, after rule `route_to` lookup, check if the name matches a profile key; if so, re-enter the routing loop for that profile with a depth guard (max depth = 4)
+1. **Config-load static check (preferred):** on startup, walk the full `route_to` graph across all profile rules using DFS. If a cycle is found, refuse to start and emit a clear error:
+   ```
+   Error: circular profile route detected: auto → code-auto → auto
+   Fix: break the cycle — no profile may route to itself or to an ancestor
+   ```
+   This is the right place to catch misconfiguration — fail early, loud, and specifically.
+
+2. **Runtime depth guard (safety net):** even if static validation passes, track hop count on each request (max 8). If exceeded, return a 500 with the routing trace in the error body. Catches any cycles that arise from dynamic aliasing at request time.
+
+**What changes in code (~80 lines new Rust):**
+
+- `config/mod.rs`: after loading all profiles, run a cycle check (DFS over the `route_to` → profile name graph); error out on startup if any cycle is found
+- `router/modes.rs`: add a `depth: u8` parameter to `classify_and_dispatch`; increment on each profile re-entry; return a routing-trace error if depth exceeds the limit
 - `config/profile.rs`: no change — profiles are already stored in a `HashMap<String, ProfileConfig>` accessible to the router
 
 ---
