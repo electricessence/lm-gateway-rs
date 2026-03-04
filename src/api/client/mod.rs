@@ -185,6 +185,7 @@ mod tests {
                         classifier_think: None,
                         system_prompt: None,
                         rules: vec![],
+                        ..Default::default()
                     },
                 );
                 m

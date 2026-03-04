@@ -163,10 +163,9 @@ pub(super) fn classify_and_resolve<'a>(
                     next_visited.push(rule.route_to.clone());
                     let target_name = rule.route_to.clone();
                     debug!(cascade_to = %target_name, chain = ?next_visited, "cascading to profile");
-                    let mut inner =
+                    let inner =
                         classify_and_resolve(state, body, &target_name, next_visited).await?;
-                    // Prepend current profile so callers see the full traversal path.
-                    inner.profile_chain.insert(0, profile_name.to_owned());
+                    // profile_chain already contains the full traversal (seeded via next_visited).
                     return Ok(inner);
                 }
             } else {
@@ -466,6 +465,14 @@ pub(super) async fn classify_and_dispatch(
     let config = state.config();
     let visited = vec![profile_name.to_owned()];
     let resolution = classify_and_resolve(state, body, profile_name, visited).await?;
+
+    // Apply per-class system prompt from the final profile in the cascade chain.
+    let final_profile_name = resolution.profile_chain.last().map(String::as_str).unwrap_or(profile_name);
+    if let Some(final_profile) = config.profiles.get(final_profile_name) {
+        if let Some(class_prompt) = final_profile.class_prompts.get(resolution.class_label.as_str()) {
+            super::inject_system_prompt(body, class_prompt);
+        }
+    }
 
     // Inject think override before dispatching.
     if let Some(t) = resolution.think_override {

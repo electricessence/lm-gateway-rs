@@ -128,6 +128,113 @@ Both are optional and fire async so they don't add latency to the request path.
 
 ---
 
+### Profile cascade routing (hierarchical `route_to`)
+
+Currently, `route_to` in classify-mode rules accepts a **tier name**. Allowing it to also accept a **profile name** enables two-level routing without any new API surface.
+
+**How it works:**
+
+When resolving `route_to`, the gateway checks if the value is a known profile name before checking tiers. If it is a profile, the request re-enters that profile's routing loop (same request, same process, same HTTP — no external round-trip). A depth counter prevents infinite cycles.
+
+**Example — domain dispatch at the first level, complexity dispatch at the second:**
+
+```toml
+# Top-level domain router
+[profiles.auto]
+mode          = "classify"
+classifier    = "local:instant"
+classifier_prompt = """
+Classify the domain. Reply with one label only.
+home         : "Turn on the lights", "Is the door locked?"
+code         : "Write a script", "Create a spreadsheet formula"
+document     : "Write me a report", "Draft an email"
+general      : "Tell me a joke", "Good morning"
+"""
+
+[[profiles.auto.rules]]
+when     = { class = "home" }
+route_to = "ha-auto"           # ← profile name, not a tier
+priority = 30
+
+[[profiles.auto.rules]]
+when     = { class = "code" }
+route_to = "code-auto"         # ← profile name
+priority = 20
+
+# (no rule for general → falls through to tier-label routing → local:instant)
+
+# Second-level: code complexity router
+[profiles.code-auto]
+mode          = "classify"
+classifier    = "local:instant"
+max_auto_tier = "cloud:deep"
+classifier_prompt = """
+How complex is this coding task? Reply with one label only.
+simple  : "Write a single function", "Fix this typo"
+complex : "Architect a full system", "Create an Excel formula with VBA"
+"""
+```
+
+This is additive and backward-compatible. Profiles without `route_to` pointing at other profiles work exactly as today.
+
+**Cycle detection — two layers:**
+
+1. **Config-load static check (preferred):** on startup, walk the full `route_to` graph across all profile rules using DFS. If a cycle is found, refuse to start and emit a clear error:
+   ```
+   Error: circular profile route detected: auto → code-auto → auto
+   Fix: break the cycle — no profile may route to itself or to an ancestor
+   ```
+   This is the right place to catch misconfiguration — fail early, loud, and specifically.
+
+2. **Per-request visited set (runtime breadcrumbs):** each request carries the *set of profiles already traversed* in its routing path. Before re-entering a profile via `route_to`, check if that profile is already in the visited set. If so, skip the rule and continue to the next one (or fall through to tier-label routing).
+
+   This is stronger than a raw depth counter: it prevents any indirect cycle dynamically, and it gives a semantically clear error — `"auto" already in routing chain: auto → code-auto → auto`. It also naturally produces the `X-LMG-Profile` trace header as a side effect — the visited set *is* the routing breadcrumb trail.
+
+   Example flow for `auto → code-auto`:
+   1. Request enters `auto` — visited = `{auto}`
+   2. Rule matches `domain=code` → `route_to = "code-auto"` — `code-auto` not in visited → proceed
+   3. Request re-enters `code-auto` — visited = `{auto, code-auto}`
+   4. If any rule in `code-auto` points back to `auto` → skip (already visited)
+   5. Falls through to tier dispatch → `cloud:deep`
+
+**What changes in code (~80 lines new Rust):**
+
+- `config/mod.rs`: after loading all profiles, run a cycle check (DFS over the `route_to` → profile name graph); error out on startup if any input cycle is found
+- `router/modes.rs`: thread a `visited: HashSet<&str>` through `classify_and_dispatch`; insert profile name on entry; skip any `route_to` rule whose target is already in the set; populate `X-LMG-Profile` header from the set in traversal order
+- `config/profile.rs`: no change — profiles are already stored in a `HashMap<String, ProfileConfig>` accessible to the router
+
+---
+
+### Routing trace headers
+
+As a request travels through the gateway, attach response headers showing the full routing decision. Zero extra latency — the data is already computed internally.
+
+**Proposed headers (returned on every response):**
+
+| Header | Example |
+|---|---|
+| `X-LMG-Profile` | `auto → code-auto` (cascade path, or just `ha-auto` for single-hop) |
+| `X-LMG-Class` | `class=code` (top-level) / `complexity=complex` (second hop) |
+| `X-LMG-Tier` | `cloud:deep` |
+| `X-LMG-Model` | `claude-sonnet-4-5` |
+| `X-Request-ID` | `c4f3a2b1` (already implemented) |
+
+These headers:
+- Help clients/agents understand why they ended up on a given model
+- Feed the in-memory traffic log automatically — the admin UI can display the full routing decision per request
+- Provide opt-in observability without a separate tracing infrastructure
+- Are a natural complement to profile cascade routing (without them, cascade hops are opaque to the caller)
+
+Single-hop today: `X-LMG-Class: class=inquiry` / `X-LMG-Tier: local:moderate`  
+Cascade: `X-LMG-Profile: auto → code-auto` / `X-LMG-Class: class=code; complexity=complex` / `X-LMG-Tier: cloud:deep`
+
+**What changes in code (~40 lines new Rust):**
+
+- `router/modes.rs`: collect `(profile, class, tier, model)` tuples during routing; attach as response headers before returning
+- `traffic.rs`: extend `TrafficEntry` to store routing trace alongside existing fields
+
+---
+
 ## Medium Range
 
 ### TLS for the admin port

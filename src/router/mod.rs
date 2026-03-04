@@ -263,6 +263,13 @@ pub async fn route_stream(
     let target_tier_name: String = if profile.mode == RoutingMode::Classify {
         let visited = vec![profile_name.to_owned()];
         let resolution = classify_and_resolve(state, &request_body, profile_name, visited).await?;
+        // Apply per-class system prompt from the final profile in the cascade chain.
+        let final_profile_name = resolution.profile_chain.last().map(String::as_str).unwrap_or(profile_name);
+        if let Some(final_profile) = config.profiles.get(final_profile_name) {
+            if let Some(class_prompt) = final_profile.class_prompts.get(resolution.class_label.as_str()) {
+                inject_system_prompt(&mut request_body, class_prompt);
+            }
+        }
         // Inject think override before streaming dispatch.
         if let Some(t) = resolution.think_override {
             if let Some(obj) = request_body.as_object_mut() {
@@ -359,7 +366,7 @@ pub async fn route_stream(
 /// placed before its content (separated by `\n\n`), so client-provided context
 /// is preserved while the profile's instructions take precedence.
 /// If there is no existing system message, one is inserted at index 0.
-fn inject_system_prompt(body: &mut Value, prompt: &str) {
+pub(super) fn inject_system_prompt(body: &mut Value, prompt: &str) {
     let Some(messages) = body.pointer_mut("/messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -525,6 +532,7 @@ mod tests {
                         classifier_think: None,
                         system_prompt: None,
                         rules: vec![],
+                        ..Default::default()
                     },
                 );
                 m

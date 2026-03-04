@@ -55,7 +55,7 @@ pub struct RuleConfig {
 }
 
 /// Routing profile — controls routing behaviour for a client.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProfileConfig {
     /// Routing mode.
     #[serde(default)]
@@ -125,6 +125,22 @@ pub struct ProfileConfig {
     /// An empty (or absent) `rules` list leaves behaviour identical to no-rules mode.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+
+    /// Per-class system prompt overrides, keyed by the classification label
+    /// returned by the classifier (e.g. `"command"`, `"inquiry"`, `"greeting"`).
+    ///
+    /// When the classifier assigns a label, the matching prompt is prepended to the
+    /// request's system message immediately before dispatch — after the profile-level
+    /// `system_prompt`. Enables per-intent framing without duplicating the main prompt.
+    ///
+    /// ```toml
+    /// [profiles.ha-auto.class_prompts]
+    /// command      = "Execute the home action directly. Confirm briefly."
+    /// conversation = "The user is responding to your prior question. Use the conversation history."
+    /// inquiry      = "The user is asking about device state. Query and respond in one sentence."
+    /// ```
+    #[serde(default)]
+    pub class_prompts: HashMap<String, String>,
 }
 
 /// Default classification prompt injected as the system message for `classify` mode.
