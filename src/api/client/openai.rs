@@ -16,7 +16,7 @@ use crate::{
     api::{client_auth::ClientProfile, request_id::RequestId},
     backends::SseStream,
     error::AppError,
-    router::RouterState,
+    router::{priority::parse_priority, RouterState},
 };
 
 /// `POST /v1/chat/completions` — route a chat request through the tier ladder.
@@ -37,6 +37,7 @@ pub async fn chat_completions(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let priority = parse_priority(&headers);
     let req_id = request_id_ext.map(|Extension(id)| id.0);
     let profile = client_profile.map(|Extension(p)| p.0);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -68,7 +69,7 @@ pub async fn chat_completions(
         .to_owned();
 
     if streaming {
-        match crate::router::route_stream(&state, body, profile.as_deref(), req_id.as_deref(), expert_gate, false).await {
+        match crate::router::route_stream(&state, body, profile.as_deref(), req_id.as_deref(), priority, expert_gate, false).await {
             Ok((stream, entry, _is_native)) => {
                 let mut response = proxy_sse(stream);
                 super::inject_routing_headers(response.headers_mut(), &entry, &state.config());
@@ -78,7 +79,7 @@ pub async fn chat_completions(
         }
     }
 
-    match crate::router::route(&state, body, profile.as_deref(), req_id.as_deref(), false, expert_gate).await {
+    match crate::router::route(&state, body, profile.as_deref(), req_id.as_deref(), priority, false, expert_gate).await {
         Ok((resp, entry)) => {
             let mut response = Json(resp).into_response();
             super::inject_routing_headers(response.headers_mut(), &entry, &state.config());

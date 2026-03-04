@@ -39,6 +39,9 @@ use self::modes::{classify_and_dispatch, classify_and_resolve, dispatch, escalat
 
 mod classify;
 mod modes;
+pub mod priority;
+
+use priority::TierPriorityGate;
 
 /// Shared application state injected into every request handler via [`axum::extract::State`].
 pub struct RouterState {
@@ -84,6 +87,13 @@ pub struct RouterState {
     /// Each limiter enforces a total-RPM quota shared across ALL clients that
     /// resolve to the same profile. Not updated on hot-reload.
     pub profile_limiters: HashMap<String, Arc<RateLimiter>>,
+
+    /// Per-tier priority gates that enforce the "fire if top, queue if not" policy.
+    ///
+    /// Keyed by tier name. Built at startup from the configured tiers. Tiers added
+    /// via hot-reload will not have a gate and will fire immediately (safe fallback).
+    /// Not updated on hot-reload — restart required to gate newly added tiers.
+    pub gates: HashMap<String, TierPriorityGate>,
 }
 
 impl RouterState {
@@ -125,6 +135,12 @@ impl RouterState {
         if let Some(ref p) = public_profile {
             tracing::info!(profile = %p, "public (unauthenticated) profile configured");
         }
+        let gates: HashMap<String, TierPriorityGate> = config
+            .tiers
+            .iter()
+            .map(|t| (t.name.clone(), TierPriorityGate::new()))
+            .collect();
+        tracing::debug!(count = gates.len(), "priority gates initialised");
         Self {
             config_lock: Arc::new(RwLock::new(config)),
             config_path,
@@ -135,6 +151,7 @@ impl RouterState {
             client_map,
             public_profile,
             profile_limiters,
+            gates,
         }
     }
 
@@ -176,6 +193,7 @@ pub async fn route(
     mut request_body: Value,
     profile_name: Option<&str>,
     request_id: Option<&str>,
+    priority: i32,
     stream: bool,
     expert_gate: bool,
 ) -> anyhow::Result<(Value, TrafficEntry)> {
@@ -197,13 +215,13 @@ pub async fn route(
 
     let (response, entry) = match profile.mode {
         RoutingMode::Dispatch => {
-            dispatch(state, &mut request_body, target_tier, stream).await?
+            dispatch(state, &mut request_body, target_tier, priority, stream).await?
         }
         RoutingMode::Escalate => {
-            escalate(state, &mut request_body, profile, stream).await?
+            escalate(state, &mut request_body, profile, priority, stream).await?
         }
         RoutingMode::Classify => {
-            classify_and_dispatch(state, &mut request_body, profile_name, stream).await?
+            classify_and_dispatch(state, &mut request_body, profile_name, priority, stream).await?
         }
     };
 
@@ -220,6 +238,7 @@ pub async fn route(
     if let Some(id) = request_id {
         entry = entry.with_id(id);
     }
+    entry = entry.with_priority(priority);
 
     state.traffic.push(entry.clone());
 
@@ -240,6 +259,7 @@ pub async fn route_stream(
     mut request_body: Value,
     profile_name: Option<&str>,
     request_id: Option<&str>,
+    priority: i32,
     expert_gate: bool,
     use_native: bool,
 ) -> anyhow::Result<(SseStream, TrafficEntry, bool)> {
@@ -355,6 +375,7 @@ pub async fn route_stream(
     if let Some((class_label, profile_chain)) = routing_trace {
         entry = entry.with_routing_trace(class_label, profile_chain);
     }
+    entry = entry.with_priority(priority);
 
     state.traffic.push(entry.clone());
 
@@ -567,7 +588,7 @@ mod tests {
         let state = mock_state(&server, RoutingMode::Dispatch).await;
         let body = json!({ "model": "hint:fast", "messages": [{"role": "user", "content": "hi"}] });
 
-        let result = route(&state, body, None, None, false, false).await;
+        let result = route(&state, body, None, None, 0, false, false).await;
         assert!(result.is_ok(), "dispatch failed: {:?}", result.err());
 
         let (resp, entry) = result.unwrap();
@@ -591,7 +612,7 @@ mod tests {
         let state = mock_state(&server, RoutingMode::Dispatch).await;
         let body = json!({ "model": "cloud:economy", "messages": [] });
 
-        let (_, entry) = route(&state, body, None, None, false, false).await.unwrap();
+        let (_, entry) = route(&state, body, None, None, 0, false, false).await.unwrap();
         assert_eq!(entry.tier, "cloud:economy");
     }
 
@@ -610,7 +631,7 @@ mod tests {
         let state = mock_state(&server, RoutingMode::Escalate).await;
         let body = json!({ "model": "hint:fast", "messages": [] });
 
-        let (_, entry) = route(&state, body, None, None, false, false).await.unwrap();
+        let (_, entry) = route(&state, body, None, None, 0, false, false).await.unwrap();
         // Should have stopped at the first (cheapest) tier
         assert_eq!(entry.tier, "local:fast");
     }
@@ -629,7 +650,7 @@ mod tests {
         let state = mock_state(&server, RoutingMode::Dispatch).await;
         let body = json!({ "model": "local:fast", "messages": [] });
 
-        route(&state, body, None, None, false, false).await.unwrap();
+        route(&state, body, None, None, 0, false, false).await.unwrap();
 
         let entries = state.traffic.recent(10).await;
         assert_eq!(entries.len(), 1);
@@ -664,7 +685,7 @@ mod tests {
             Arc::new(TrafficLog::new(10)),
         );
 
-        let result = route(&state, json!({}), None, None, false, false).await;
+        let result = route(&state, json!({}), None, None, 0, false, false).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -687,7 +708,7 @@ mod tests {
         // "totally:unknown" exists in neither aliases nor tiers — should fall back to classifier
         let body = json!({ "model": "totally:unknown", "messages": [] });
 
-        let (_, entry) = route(&state, body, None, None, false, false).await.unwrap();
+        let (_, entry) = route(&state, body, None, None, 0, false, false).await.unwrap();
         // classifier is "local:fast"
         assert_eq!(entry.tier, "local:fast");
     }

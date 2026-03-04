@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::{
     api::{client_auth::ClientProfile, request_id::RequestId},
     error::AppError,
-    router::RouterState,
+    router::{priority::parse_priority, RouterState},
 };
 
 /// `GET /api/tags` — Ollama-compatible model discovery.
@@ -95,6 +95,7 @@ pub async fn chat_completions_ollama(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let priority = parse_priority(&headers);
     let req_id = request_id_ext.map(|Extension(id)| id.0);
     let profile = client_profile.map(|Extension(p)| p.0);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -136,6 +137,7 @@ pub async fn chat_completions_ollama(
             openai_body,
             effective_profile,
             req_id.as_deref(),
+            priority,
             expert_gate,
             true, // use native /api/chat for Ollama — honours think:false
         )
@@ -174,6 +176,7 @@ pub async fn chat_completions_ollama(
         openai_body,
         effective_profile,
         req_id.as_deref(),
+        priority,
         false,
         expert_gate,
     )

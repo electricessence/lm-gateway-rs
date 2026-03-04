@@ -174,6 +174,10 @@ pub struct TrafficEntry {
     /// A single-hop request has exactly one entry (the initial profile).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_chain: Option<Vec<String>>,
+    /// Scheduling priority from the `X-LMG-Priority` request header.
+    /// `0` = normal (default), `+N` = higher, `-N` = background.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 impl TrafficEntry {
@@ -192,6 +196,7 @@ impl TrafficEntry {
             error: None,
             class_label: None,
             profile_chain: None,
+            priority: 0,
         }
     }
 
@@ -232,6 +237,12 @@ impl TrafficEntry {
     /// reference the same identifier.
     pub fn with_id(mut self, id: &str) -> Self {
         self.id = id.to_string();
+        self
+    }
+
+    /// Attach the scheduling priority from `X-LMG-Priority`.
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
         self
     }
 

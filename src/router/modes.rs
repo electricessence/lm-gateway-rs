@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use crate::{
     backends::BackendClient,
-    config::{Config, ProfileConfig, TierConfig, DEFAULT_CLASSIFIER_PROMPT},
+    config::{Config, ProfileConfig, Provider, TierConfig, DEFAULT_CLASSIFIER_PROMPT},
     traffic::TrafficEntry,
 };
 
@@ -288,10 +288,15 @@ pub(super) fn resolve_target_tier<'a>(
 /// backend.  Retries up to `config.gateway.max_retries` times on failure, with
 /// exponential backoff starting at `config.gateway.retry_delay_ms` (default
 /// 200 ms), doubling per attempt, capped at 2 000 ms.
+///
+/// For local providers (Ollama, OpenAI-compat), the request waits for a
+/// priority permit before calling the backend, serialising lower-priority work
+/// behind higher-priority in-flight requests. Cloud providers bypass the gate.
 pub(super) async fn dispatch(
     state: &RouterState,
     body: &mut Value,
     tier: &TierConfig,
+    priority: i32,
     stream: bool,
 ) -> anyhow::Result<(Value, TrafficEntry)> {
     let config = state.config();
@@ -311,6 +316,22 @@ pub(super) async fn dispatch(
             obj.entry("think").or_insert(Value::Bool(think));
         }
     }
+
+    // Acquire the priority gate for local providers.
+    // Cloud-managed providers (Anthropic, OpenRouter) bypass the gate — the
+    // cloud handles its own scheduling and adding a gateway queue would only
+    // increase tail latency without benefit.
+    let is_cloud = matches!(backend_cfg.provider, Provider::Anthropic | Provider::OpenRouter);
+    let _gate_permit = if !is_cloud {
+        if let Some(gate) = state.gates.get(&tier.name) {
+            Some(gate.acquire(priority).await)
+        } else {
+            None // Tier was added after startup (hot-reload) — fire immediately.
+        }
+    } else {
+        None
+    };
+
     let max_retries = config.gateway.max_retries.unwrap_or(0);
     let retry_delay_ms = config.gateway.retry_delay_ms.unwrap_or(200);
 
@@ -381,6 +402,7 @@ pub(super) async fn escalate(
     state: &RouterState,
     body: &mut Value,
     profile: &ProfileConfig,
+    priority: i32,
     stream: bool,
 ) -> anyhow::Result<(Value, TrafficEntry)> {
     let config = state.config();
@@ -437,6 +459,18 @@ pub(super) async fn escalate(
             }
         };
 
+        // Acquire gate for local providers (same policy as dispatch).
+        let is_cloud = matches!(backend_cfg.provider, Provider::Anthropic | Provider::OpenRouter);
+        let _gate_permit = if !is_cloud {
+            if let Some(gate) = state.gates.get(&tier.name) {
+                Some(gate.acquire(priority).await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let t0 = std::time::Instant::now();
         match client.chat_completions(body.clone()).await {
             Ok(response) => {
@@ -472,6 +506,7 @@ pub(super) async fn classify_and_dispatch(
     state: &RouterState,
     body: &mut Value,
     profile_name: &str,
+    priority: i32,
     stream: bool,
 ) -> anyhow::Result<(Value, TrafficEntry)> {
     let config = state.config();
@@ -499,7 +534,7 @@ pub(super) async fn classify_and_dispatch(
         .find(|t| t.name == resolution.tier_name)
         .with_context(|| format!("resolved tier `{}` not found in config", resolution.tier_name))?;
 
-    let (response, entry) = dispatch(state, body, tier, stream).await?;
+    let (response, entry) = dispatch(state, body, tier, priority, stream).await?;
     let entry = entry.with_routing_trace(resolution.class_label, resolution.profile_chain);
     Ok((response, entry))
 }
