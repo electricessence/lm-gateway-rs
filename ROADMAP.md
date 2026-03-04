@@ -38,11 +38,117 @@ A lightweight, single-binary LLM routing gateway in Rust. No Python. No database
 - **Pluggable secret backends**: `api_key_secret = { source = "env", var = "..." }` or `{ source = "file", path = "..." }` — supports Docker secrets, Kubernetes mounts, any file-based store
 - **Admin dashboard improvements**: backend cards show live health + traffic error rate; profiles section; secret source badge (env/file); setup warning banner when keys are unresolved
 
+**v0.3 — Complete**
+
+- **`X-LMG-Priority` scheduling**: per-tier priority gate implementing "fire if top, queue if not" —
+  requests with `P > max(in_flight)` fire immediately; lower-priority requests queue in FIFO order.
+  Priority logged in every `TrafficEntry`.
+  Priority scale: `+N` = high (user traffic), `0` = normal, `-N` = background (audit pipeline).
+  Header: `X-LMG-Priority: <integer>` on any request to the client API.
+  *Note:* cloud providers (Anthropic, OpenRouter) currently bypass the gate via a hardcoded heuristic.
+  This will be replaced by explicit `queue_id` config — see the Long Range priority section below.
+
 ---
 
 ## Short Range
 
 > Targeted next
+
+### Queue-depth overflow routing
+
+When a high-priority request arrives and the target tier's queue is already deep, automatically
+route to a faster fallback tier instead of waiting. Two control points:
+
+**1. Per-tier config policy** — the gateway enforces a queue-depth ceiling per tier:
+
+```toml
+[[tiers]]
+name     = "local:deep"
+backend  = "ollama"
+model    = "qwen3:14b"
+# When the queue is this deep AND the request priority is at least 50,
+# route to overflow_tier instead of queuing.
+overflow_tier          = "cloud:haiku"  # any tier or alias; cloud or another local server
+overflow_depth         = 2              # in-flight + pending > this → consider overflow
+overflow_min_priority  = 50            # only overflow for requests at or above this priority
+```
+
+**2. Per-request header hint** — callers can express their own tolerance:
+
+```
+X-LMG-Max-Queue: 3
+```
+
+Means: "I'm willing to wait behind up to 3 in-flight requests. If the queue is deeper than that,
+route me to the configured overflow tier instead."
+
+Neither alone is sufficient — the config ceiling is what the gateway trusts; the header lets
+callers be more conservative on a per-call basis. A request only overflows when **both** conditions
+allow it (callers cannot exceed the tier's `overflow_min_priority` policy).
+
+**Overflow destination can be anything:**
+- A cloud model (`cloud:haiku`) for fast, low-latency responses
+- Another local server with more capacity
+- A less powerful but less congested local tier
+
+**What changes in code (~120 lines new Rust):**
+
+- `config/profile.rs` or `config/mod.rs`: add `overflow_tier`, `overflow_depth`,
+  `overflow_min_priority` to `TierConfig` (all optional; overflow is disabled when unset)
+- `router/priority.rs`: add `TierPriorityGate::depth() -> usize` method returning
+  `in_flight.len() + pending.len()`
+- `router/mod.rs`: before calling `dispatch()`, check overflow conditions and substitute the
+  overflow tier if triggered; parse `X-LMG-Max-Queue` header alongside `X-LMG-Priority`
+- `traffic.rs`: flag `overflowed: bool` on `TrafficEntry` so the admin UI can show when
+  overflow routing fired
+
+---
+
+### Identity-assigned priority — server-side default and ceiling per client
+
+The current implementation lets callers set their own priority via `X-LMG-Priority`. This is
+acceptable for open environments but unsafe for multi-tenant deployments: a low-trust agent
+could claim `X-LMG-Priority: 1000` and starve everyone else.
+
+The fix is server-assigned priority tied to the authenticated identity. Each `[[clients]]` entry
+gets two new optional fields:
+
+```toml
+[[clients]]
+key_env          = "TELEGRAM_MCP_KEY"
+profile          = "default"
+default_priority = 100    # assigned when no X-LMG-Priority header is present
+priority_ceiling = 100    # maximum priority this identity may claim (default = default_priority)
+```
+
+**Resolution logic (in handler, after auth middleware injects identity):**
+
+1. Identity resolved → read `default_priority` (fallback: 0) and `priority_ceiling` (fallback: `default_priority`)
+2. If `X-LMG-Priority` header present → `effective = min(ceiling, header_value)`
+3. If header absent → `effective = default_priority`
+
+A client identified as Telegram MCP gets priority 100 automatically — not because it declared
+the header, but because the server recognises its key. Setting `priority_ceiling = 100` prevents
+the client from requesting anything higher than 100, even if it tries.
+
+**Flexible policy:**
+- Locked identity: `default_priority = 100, priority_ceiling = 100` — fixed, client cannot alter it
+- Trusted identity: `default_priority = 0, priority_ceiling = 200` — starts at normal priority, can boost for urgent tasks
+- Untrusted identity: `default_priority = -10, priority_ceiling = 0` — background by default, cannot claim real-time slots
+
+**What changes in code (~60 lines new Rust):**
+
+- `config/mod.rs`: add `default_priority: i32` and `priority_ceiling: Option<i32>` to `ClientConfig`
+- `api/client_auth.rs`: expand `ClientProfile` extension (or add `ClientPriority` extension) to
+  carry `default_priority` and `priority_ceiling`
+- `api/client/openai.rs` + `ollama.rs`: read identity priority from extension;
+  `effective_priority = min(ceiling, parse_priority(&headers).unwrap_or(default_priority))`
+
+For unauthenticated requests (no API key, `public_profile` path): priority defaults to 0.
+IP-based priority lookup is a future extension — the identity model covers the authenticated
+case cleanly first.
+
+---
 
 ### Semantic tagging — multi-label classification and rule-based routing
 
@@ -250,6 +356,36 @@ For deterministic or near-deterministic prompts, cache the response against a ha
 ## Long Range
 
 ### Priority-aware request queue
+
+**Implemented in v0.3** as `X-LMG-Priority` header scheduling. The core gate is live.
+See [v0.3 release notes](#v03--complete) and `src/router/priority.rs` for the implementation.
+
+The items below describe further evolution of the priority system:
+
+- **Configurable queue ID per tier** — remove the hardcoded cloud-bypass heuristic and replace with
+  an explicit queue assignment. Every tier has a `queue_id` (defaults to the tier name):
+  ```toml
+  [[tiers]]
+  name     = "cloud:haiku"
+  backend  = "anthropic"
+  model    = "claude-haiku-4-5"
+  queue_id = "anthropic"        # share one gate across all Anthropic tiers
+  # queue_id = ""               # empty string = no gate, fire immediately
+  ```
+  Multiple tiers sharing the same `queue_id` share one gate — useful for shaping total throughput
+  to a provider without serialising individual tier queues. An empty or absent `queue_id` disables
+  gating entirely (current cloud default). This replaces the hardcoded `is_cloud` heuristic with a
+  policy the operator controls.
+
+- **Tier default priority**: configure a default `priority` on a tier so all requests going to
+  that tier inherit a base priority without the caller needing to set the header
+- **Profile priority ceiling**: profiles can set `max_priority` to prevent callers from
+  jumping ahead of other profiles' traffic
+- **Queue depth limit + 429**: reject or return `429 Too Many Requests` when the pending queue
+  exceeds a configurable depth, to bound memory usage under flood conditions
+- **Streaming permit lifecycle**: for stream requests, hold the priority permit until the
+  stream is fully consumed (today the permit is released at first-byte), giving a tighter
+  "this GPU slot is occupied" guarantee for long-running streams
 
 A per-model request queue with priority scheduling. The gateway holds back requests to avoid overloading the backend, and processes them in priority order so interactive traffic is never starved by batch work.
 
