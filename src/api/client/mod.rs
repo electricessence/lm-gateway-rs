@@ -7,12 +7,13 @@
 use std::sync::Arc;
 
 use axum::{
+    http::HeaderMap,
     routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
 
-use crate::router::RouterState;
+use crate::{config::Config, router::RouterState, traffic::TrafficEntry};
 
 mod ollama;
 mod openai;
@@ -29,6 +30,45 @@ pub fn router(state: Arc<RouterState>) -> Router {
         .route("/api/tags", get(ollama::list_models_ollama))
         .route("/api/chat", post(ollama::chat_completions_ollama))
         .with_state(state)
+}
+
+/// Inject routing trace headers into a response.
+///
+/// Adds the following headers when the data is available:
+/// - `X-LMG-Tier`    — tier that handled the request (e.g. `local:instant`)
+/// - `X-LMG-Model`   — model used by that tier (e.g. `qwen3:1.7b`)
+/// - `X-LMG-Profile` — profile chain (e.g. `auto → code-auto` or just `ha-auto`)
+/// - `X-LMG-Class`   — class label from classification (e.g. `greeting`)
+pub(super) fn inject_routing_headers(headers: &mut HeaderMap, entry: &TrafficEntry, config: &Config) {
+    // X-LMG-Tier
+    if let Ok(val) = entry.tier.parse() {
+        headers.insert("x-lmg-tier", val);
+    }
+    // X-LMG-Model — look up from config tiers
+    if let Some(model) = config.tiers.iter().find(|t| t.name == entry.tier).map(|t| &t.model) {
+        if let Ok(val) = model.parse() {
+            headers.insert("x-lmg-model", val);
+        }
+    }
+    // X-LMG-Profile — cascade chain if available, else single profile name
+    let profile_str = entry
+        .profile_chain
+        .as_deref()
+        .map(|c| c.join(" -> "))            // ASCII-safe separator
+        .or_else(|| entry.profile.clone());
+    if let Some(p) = profile_str {
+        if let Ok(val) = p.parse() {
+            headers.insert("x-lmg-profile", val);
+        }
+    }
+    // X-LMG-Class — only when classification was performed
+    if let Some(class) = &entry.class_label {
+        if !class.is_empty() {
+            if let Ok(val) = class.parse() {
+                headers.insert("x-lmg-class", val);
+            }
+        }
+    }
 }
 
 /// Classify a backend error into a short, user-readable message.

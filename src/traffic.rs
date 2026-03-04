@@ -166,6 +166,14 @@ pub struct TrafficEntry {
     pub success: bool,
     /// Error description when `success` is `false`.
     pub error: Option<String>,
+    /// Classification class label (e.g. `"greeting"`, `"command"`).
+    /// Populated only when the profile uses `mode = "classify"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_label: Option<String>,
+    /// Ordered list of profiles traversed during cascade routing.
+    /// A single-hop request has exactly one entry (the initial profile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_chain: Option<Vec<String>>,
 }
 
 impl TrafficEntry {
@@ -182,6 +190,8 @@ impl TrafficEntry {
             latency_ms,
             success,
             error: None,
+            class_label: None,
+            profile_chain: None,
         }
     }
 
@@ -222,6 +232,21 @@ impl TrafficEntry {
     /// reference the same identifier.
     pub fn with_id(mut self, id: &str) -> Self {
         self.id = id.to_string();
+        self
+    }
+
+    /// Attach routing trace from a classify-mode resolution.
+    ///
+    /// Records the class label (e.g. `"greeting"`) and the ordered chain of
+    /// profiles traversed during cascade routing. Used to populate
+    /// `X-LMG-Class` and `X-LMG-Profile` response headers.
+    pub fn with_routing_trace(mut self, class_label: String, profile_chain: Vec<String>) -> Self {
+        if !class_label.is_empty() {
+            self.class_label = Some(class_label);
+        }
+        if !profile_chain.is_empty() {
+            self.profile_chain = Some(profile_chain);
+        }
         self
     }
 }

@@ -499,7 +499,9 @@ pub(super) async fn classify_and_dispatch(
         .find(|t| t.name == resolution.tier_name)
         .with_context(|| format!("resolved tier `{}` not found in config", resolution.tier_name))?;
 
-    dispatch(state, body, tier, stream).await
+    let (response, entry) = dispatch(state, body, tier, stream).await?;
+    let entry = entry.with_routing_trace(resolution.class_label, resolution.profile_chain);
+    Ok((response, entry))
 }
 
 /// Decide whether a backend response is good enough to return or should be escalated.

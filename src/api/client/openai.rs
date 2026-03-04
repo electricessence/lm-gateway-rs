@@ -69,13 +69,21 @@ pub async fn chat_completions(
 
     if streaming {
         match crate::router::route_stream(&state, body, profile.as_deref(), req_id.as_deref(), expert_gate, false).await {
-            Ok((stream, _entry, _is_native)) => return Ok(proxy_sse(stream)),
+            Ok((stream, entry, _is_native)) => {
+                let mut response = proxy_sse(stream);
+                super::inject_routing_headers(response.headers_mut(), &entry, &state.config());
+                return Ok(response);
+            }
             Err(e) => return Ok(Json(super::error_openai_response(&e, &model_name)).into_response()),
         }
     }
 
     match crate::router::route(&state, body, profile.as_deref(), req_id.as_deref(), false, expert_gate).await {
-        Ok((resp, _entry)) => Ok(Json(resp).into_response()),
+        Ok((resp, entry)) => {
+            let mut response = Json(resp).into_response();
+            super::inject_routing_headers(response.headers_mut(), &entry, &state.config());
+            Ok(response)
+        }
         Err(e) => Ok(Json(super::error_openai_response(&e, &model_name)).into_response()),
     }
 }

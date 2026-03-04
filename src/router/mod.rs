@@ -260,32 +260,34 @@ pub async fn route_stream(
     // In classify mode, run a non-streaming pre-flight call through classify_and_resolve,
     // which handles rule evaluation and profile cascade routing, then stream from the
     // resolved tier.  This path now shares all routing logic with the non-streaming path.
-    let target_tier_name: String = if profile.mode == RoutingMode::Classify {
-        let visited = vec![profile_name.to_owned()];
-        let resolution = classify_and_resolve(state, &request_body, profile_name, visited).await?;
-        // Apply per-class system prompt from the final profile in the cascade chain.
-        let final_profile_name = resolution.profile_chain.last().map(String::as_str).unwrap_or(profile_name);
-        if let Some(final_profile) = config.profiles.get(final_profile_name) {
-            if let Some(class_prompt) = final_profile.class_prompts.get(resolution.class_label.as_str()) {
-                inject_system_prompt(&mut request_body, class_prompt);
+    let (target_tier_name, routing_trace): (String, Option<(String, Vec<String>)>) =
+        if profile.mode == RoutingMode::Classify {
+            let visited = vec![profile_name.to_owned()];
+            let resolution = classify_and_resolve(state, &request_body, profile_name, visited).await?;
+            // Apply per-class system prompt from the final profile in the cascade chain.
+            let final_profile_name = resolution.profile_chain.last().map(String::as_str).unwrap_or(profile_name);
+            if let Some(final_profile) = config.profiles.get(final_profile_name) {
+                if let Some(class_prompt) = final_profile.class_prompts.get(resolution.class_label.as_str()) {
+                    inject_system_prompt(&mut request_body, class_prompt);
+                }
             }
-        }
-        // Inject think override before streaming dispatch.
-        if let Some(t) = resolution.think_override {
-            if let Some(obj) = request_body.as_object_mut() {
-                obj.insert("think".into(), Value::Bool(t));
+            // Inject think override before streaming dispatch.
+            if let Some(t) = resolution.think_override {
+                if let Some(obj) = request_body.as_object_mut() {
+                    obj.insert("think".into(), Value::Bool(t));
+                }
             }
-        }
-        debug!(
-            tier = %resolution.tier_name,
-            label = %resolution.class_label,
-            chain = ?resolution.profile_chain,
-            "stream classify resolved"
-        );
-        resolution.tier_name
-    } else {
-        resolved_tier.name.clone()
-    };
+            debug!(
+                tier = %resolution.tier_name,
+                label = %resolution.class_label,
+                chain = ?resolution.profile_chain,
+                "stream classify resolved"
+            );
+            let trace = (resolution.class_label, resolution.profile_chain);
+            (resolution.tier_name, Some(trace))
+        } else {
+            (resolved_tier.name.clone(), None)
+        };
 
     let target_tier = config
         .tiers
@@ -349,6 +351,9 @@ pub async fn route_stream(
     .with_routing_mode(routing_mode);
     if let Some(id) = request_id {
         entry = entry.with_id(id);
+    }
+    if let Some((class_label, profile_chain)) = routing_trace {
+        entry = entry.with_routing_trace(class_label, profile_chain);
     }
 
     state.traffic.push(entry.clone());
