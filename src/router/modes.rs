@@ -200,8 +200,27 @@ pub(super) fn classify_and_resolve<'a>(
                 let rule_tier = config
                     .resolve_tier(&rule.route_to)
                     .with_context(|| format!("rule route_to `{}` not found in config", rule.route_to))?;
+
+                // Context-window gating: if the rule's target tier can't fit the
+                // request, bump up to the next tier that can.
+                let estimated_tokens = super::estimate_request_tokens(body);
+                let rule_idx = candidates.iter().position(|t| t.name == rule_tier.name).unwrap_or(0);
+                let min_idx = super::find_min_tier_for_tokens(candidates, estimated_tokens, rule_idx);
+                let final_tier_name = if min_idx > rule_idx {
+                    debug!(
+                        profile = %profile_name,
+                        estimated_tokens,
+                        from = %rule_tier.name,
+                        to = %candidates[min_idx].name,
+                        "context-window floor — bumping rule-matched tier"
+                    );
+                    candidates[min_idx].name.clone()
+                } else {
+                    rule_tier.name.clone()
+                };
+
                 return Ok(RoutingResolution {
-                    tier_name: rule_tier.name.clone(),
+                    tier_name: final_tier_name,
                     think_override,
                     class_label: class_label.clone(),
                     profile_chain: visited,

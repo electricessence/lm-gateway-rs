@@ -57,7 +57,8 @@ use priority::TierPriorityGate;
 /// upper bound — we'd rather bump up a tier unnecessarily than overflow a
 /// context window.
 pub(crate) fn estimate_request_tokens(body: &Value) -> u32 {
-    let bpe = tiktoken_rs::o200k_base_singleton();
+    let bpe = tiktoken_rs::get_bpe_from_model("gpt-4o")
+        .expect("gpt-4o BPE should be available in tiktoken_rs");
 
     let messages = body.pointer("/messages").and_then(Value::as_array);
     let tools = body.pointer("/tools").and_then(Value::as_array);
@@ -68,8 +69,23 @@ pub(crate) fn estimate_request_tokens(body: &Value) -> u32 {
         for msg in msgs {
             // Per-message overhead (role, separators) — OpenAI uses ~4 tokens per message
             token_count += 4;
-            if let Some(content) = msg.get("content").and_then(Value::as_str) {
-                token_count += bpe.encode_ordinary(content).len();
+            // Handle both string and array-of-parts content (for multimodal requests).
+            if let Some(content_val) = msg.get("content") {
+                match content_val {
+                    Value::String(text) => {
+                        token_count += bpe.encode_ordinary(text).len();
+                    }
+                    Value::Array(parts) => {
+                        for part in parts {
+                            if let Some("text") = part.get("type").and_then(Value::as_str) {
+                                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                    token_count += bpe.encode_ordinary(text).len();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
             if let Some(role) = msg.get("role").and_then(Value::as_str) {
                 token_count += bpe.encode_ordinary(role).len();
@@ -279,10 +295,9 @@ pub async fn route(
     let (mut target_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
 
-    // Context-window gating: estimate the request's token count and bump the
-    // target tier upward if it can't fit. This applies to dispatch and escalate
-    // modes — classify mode handles it inside classify_and_resolve.
-    if profile.mode != RoutingMode::Classify {
+    // Context-window gating for dispatch mode only. Classify and escalate modes
+    // handle their own gating inside classify_and_resolve() / escalate().
+    if profile.mode == RoutingMode::Dispatch {
         let estimated_tokens = estimate_request_tokens(&request_body);
         let tier_idx = config.tiers.iter().position(|t| t.name == target_tier.name).unwrap_or(0);
         let min_idx = find_min_tier_for_tokens(&config.tiers, estimated_tokens, tier_idx);
@@ -364,8 +379,8 @@ pub async fn route_stream(
     let (mut resolved_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
 
-    // Context-window gating for non-classify modes (classify handles it internally).
-    if profile.mode != RoutingMode::Classify {
+    // Context-window gating for dispatch mode only (classify/escalate handle it internally).
+    if profile.mode == RoutingMode::Dispatch {
         let estimated_tokens = estimate_request_tokens(&request_body);
         let tier_idx = config.tiers.iter().position(|t| t.name == resolved_tier.name).unwrap_or(0);
         let min_idx = find_min_tier_for_tokens(&config.tiers, estimated_tokens, tier_idx);
