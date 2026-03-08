@@ -47,6 +47,9 @@ futures-util = "0.3"
 dashmap = "6"   # concurrent hashmap for in-memory traffic log
 bytes = "1"
 
+# Token estimation
+tiktoken-rs = "0.9"
+
 [features]
 # native-tls: uses the platform TLS stack (schannel on Windows, OpenSSL on Linux).
 # Enabled by default for local development — no extra C compiler requirements.

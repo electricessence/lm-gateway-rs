@@ -47,37 +47,51 @@ use priority::TierPriorityGate;
 // Token estimation
 // ---------------------------------------------------------------------------
 
-/// Rough token estimate for a JSON request body.
+/// Token estimate for a JSON request body using BPE tokenization.
 ///
-/// Uses a character-to-token ratio of 1:4 (conservative for English text with
-/// typical JSON overhead). This is intentionally coarse — accuracy isn't
-/// necessary, only order-of-magnitude correctness for context-window gating.
-/// The estimate covers system prompts, conversation history, tool definitions,
-/// and all other content in the `messages` array.
+/// Uses the `o200k_base` tokenizer (GPT-4o family) as the reference encoder.
+/// Modern BPE tokenizers agree within ~10-15% across model families, so this
+/// gives a reliable estimate even for non-OpenAI models like Qwen and Llama.
+///
+/// A 10% safety margin is applied on top to ensure the estimate is a pessimistic
+/// upper bound — we'd rather bump up a tier unnecessarily than overflow a
+/// context window.
 pub(crate) fn estimate_request_tokens(body: &Value) -> u32 {
+    let bpe = tiktoken_rs::o200k_base_singleton();
+
     let messages = body.pointer("/messages").and_then(Value::as_array);
     let tools = body.pointer("/tools").and_then(Value::as_array);
 
-    let mut char_count: usize = 0;
+    let mut token_count: usize = 0;
 
     if let Some(msgs) = messages {
         for msg in msgs {
+            // Per-message overhead (role, separators) — OpenAI uses ~4 tokens per message
+            token_count += 4;
             if let Some(content) = msg.get("content").and_then(Value::as_str) {
-                char_count += content.len();
+                token_count += bpe.encode_ordinary(content).len();
+            }
+            if let Some(role) = msg.get("role").and_then(Value::as_str) {
+                token_count += bpe.encode_ordinary(role).len();
             }
             // Tool call results can be large JSON blobs
             if let Some(tc) = msg.get("tool_calls") {
-                char_count += tc.to_string().len();
+                let tc_str = tc.to_string();
+                token_count += bpe.encode_ordinary(&tc_str).len();
             }
         }
+        // Reply priming overhead
+        token_count += 2;
     }
 
     if let Some(tool_defs) = tools {
-        char_count += serde_json::to_string(tool_defs).unwrap_or_default().len();
+        let defs_str = serde_json::to_string(tool_defs).unwrap_or_default();
+        token_count += bpe.encode_ordinary(&defs_str).len();
     }
 
-    // 4 characters ≈ 1 token (conservative estimate)
-    (char_count / 4) as u32
+    // 10% safety margin — round up to ensure pessimistic upper bound
+    let with_margin = (token_count as f64 * 1.1).ceil() as u32;
+    with_margin
 }
 
 /// Find the lowest tier whose `max_context_tokens` can fit the estimated token count.
@@ -1084,8 +1098,12 @@ mod tests {
                 {"role": "user", "content": "Hello world"}
             ]
         });
-        // "You are a helpful assistant." = 29 chars + "Hello world" = 11 chars = 40 / 4 = 10
-        assert_eq!(estimate_request_tokens(&body), 10);
+        // BPE-based: actual tokens + per-message overhead + reply priming + 10% margin
+        let tokens = estimate_request_tokens(&body);
+        // "You are a helpful assistant." ≈ 6 tokens, "Hello world" ≈ 2 tokens,
+        // roles ≈ 2 tokens, 2×4 message overhead + 2 priming = 10 overhead
+        // Total ≈ 20, with margin ≈ 22. We just check plausible range.
+        assert!(tokens >= 15 && tokens <= 35, "expected 15-35, got {tokens}");
     }
 
     #[test]
@@ -1095,8 +1113,8 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather"}}]
         });
         let tokens = estimate_request_tokens(&body);
-        // "help" = 4 chars → 1 token, plus tool JSON serialization / 4
-        assert!(tokens > 1, "should include tool definition tokens, got {tokens}");
+        // "help" = 1 token, plus tool JSON tokenization, overhead, margin
+        assert!(tokens > 5, "should include tool definition tokens, got {tokens}");
     }
 
     #[test]

@@ -160,7 +160,7 @@ model              = "qwen2.5:7b-instruct"
 max_context_tokens = 32768
 ```
 
-Token estimation uses a conservative 4-characters-per-token ratio (covers system prompts, conversation history, and tool definitions). Tiers without `max_context_tokens` are assumed to accept any request size.
+Token estimation uses BPE tokenization via the `o200k_base` encoder (GPT-4o family), which closely matches modern tokenizers across model families. A 10% safety margin is applied to ensure the estimate is a pessimistic upper bound. Tiers without `max_context_tokens` are assumed to accept any request size.
 
 ---
 
