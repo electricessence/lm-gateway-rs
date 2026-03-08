@@ -1,0 +1,106 @@
+# "ha-auto" — Home Assistant voice controller profile
+#
+# 6-label semantic classify: qwen3:1.7b pre-flight identifies intent before routing.
+#   greeting     — pure social (Hi/bye/thanks/Goodnight)          → qwen3:1.7b no-think
+#   chitchat     — off-topic general knowledge or humor            → qwen3:1.7b + think
+#   command      — any action request (named or unnamed target)    → qwen2.5:7b
+#   conversation — reply to a prior model question (disambiguation) → qwen2.5:7b
+#   inquiry      — state query (is X on/locked/open?)              → qwen3:14b
+#   other        — catch-all: unrecognised or ambiguous            → qwen3:14b
+
+mode              = "classify"
+classifier        = "local:instant"
+# classifier_think = true    # uncomment to enable CoT for the pre-flight call
+max_auto_tier     = "local:deep"
+classifier_prompt = """\
+Classify this Home Assistant voice command. Reply with ONLY: class=<label>
+
+greeting     — Hi, thanks, bye, good morning/evening/night (social, no home action)
+chitchat     — joke, trivia, general knowledge question, off-topic
+command      — any action request, with or without a named device or area
+conversation — one-word or short reply to a prior assistant question
+inquiry      — state query about a specific device or area
+other        — unclear, complex, or doesn't fit any category above
+
+Examples:
+  Hi                               ->  class=greeting
+  Good morning                     ->  class=greeting
+  Thank you                        ->  class=greeting
+  Bye                              ->  class=greeting
+  Goodnight                        ->  class=greeting
+  Good evening                     ->  class=greeting
+  Tell me a joke                   ->  class=chitchat
+  What's the capital of France?    ->  class=chitchat
+  What's the capital of Brazil?    ->  class=chitchat
+  Turn on the light                ->  class=command
+  Turn off the fan                 ->  class=command
+  Lock up                          ->  class=command
+  Turn on the office light         ->  class=command
+  Turn off the kitchen light       ->  class=command
+  Lock the front door              ->  class=command
+  Set the thermostat to 72         ->  class=command
+  Dim the bedroom light to 50%     ->  class=command
+  Yes                              ->  class=conversation
+  No                               ->  class=conversation
+  The bedroom one                  ->  class=conversation
+  All of them                      ->  class=conversation
+  Is the front door locked?        ->  class=inquiry
+  Is the garage door open?         ->  class=inquiry
+  Are all the doors locked?        ->  class=inquiry
+  What lights are still on?        ->  class=inquiry
+  What is the garage door's state? ->  class=inquiry
+
+Reply with ONLY the tag. No explanation.\
+"""
+
+[[rules]]
+when     = { class = "greeting" }
+route_to = "local:instant"
+priority = 100
+
+[[rules]]
+when     = { class = "chitchat" }
+route_to = "local:fast"
+priority = 90
+
+[[rules]]
+when     = { class = "command" }
+route_to = "local:moderate"
+priority = 70
+
+[[rules]]
+when     = { class = "conversation" }
+route_to = "local:moderate"
+priority = 60
+
+[[rules]]
+when     = { class = "inquiry" }
+route_to = "local:deep"
+priority = 50
+
+[[rules]]
+when     = { class = "other" }
+route_to = "local:deep"
+priority = 10
+
+# Per-class framing nudges — prepended to system_prompt before dispatch.
+# command/other intentionally omitted: system_prompt covers commands;
+# deep model handles "other" without extra framing.
+[class_prompts]
+greeting     = "Respond warmly. Keep it to one sentence."
+chitchat     = "Answer briefly from general knowledge."
+conversation = "The user is continuing a prior exchange."
+inquiry      = "Query the device state and answer in one sentence."
+
+system_prompt = """\
+You are a Home Assistant voice controller. Execute commands via tools; confirm briefly.
+
+- Match entity names exactly from the provided list. Pick the closest match for ambiguous requests.
+- Multiple matches (e.g. two office lights): call the tool once per entity.
+- "lock" / "lock up" = HassTurnOn(domain=lock). "unlock" = HassTurnOff(domain=lock).
+- Door names: "front door" may be a contact sensor (open/closed); "front door lock" is the lock entity. Use the lock entity for lock/unlock commands and lock status queries.
+- State queries: call the tool, answer in one sentence.
+- Automation toggle: use the tool, confirm. Creating automations needs the HA UI.
+- Off-topic questions: answer in one sentence from general knowledge.
+- No entity match: ask one short clarifying question.\
+"""

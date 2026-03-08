@@ -26,6 +26,26 @@
 #   backend = "ollama"
 #   model   = "qwen3:1.7b"
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# ─── profiles/ directory ─────────────────────────────────────────────────────
+# Place per-profile TOML files in a profiles/ directory next to config.toml.
+# Each *.toml file defines one profile; the filename becomes the profile name
+# (e.g. ha-auto.toml → "ha-auto"). Use a `name = "..."` field inside the file
+# to override the name when the real name contains characters invalid in
+# filenames (e.g. colons on Windows: ha-auto_fast.toml  with name="ha-auto:fast").
+#
+# Profile files are loaded after inline [profiles.*] and conf.d/ overlays,
+# so directory profiles take precedence on name collision.
+#
+# Override the directory path with gateway.profile_dir if needed:
+#   [gateway]
+#   profile_dir = "/etc/lm-gateway/profiles"
+#
+# Example profiles/default.toml:
+#   mode          = "classify"
+#   classifier    = "local:fast"
+#   max_auto_tier = "local:deep"
+# ─────────────────────────────────────────────────────────────────────────────
 
 [gateway]
 client_port = 8080       # agent-facing client API

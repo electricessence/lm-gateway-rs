@@ -97,6 +97,22 @@ pub struct ClientConfig {
     pub profile: String,
 }
 
+/// Wrapper for deserializing a standalone profile TOML file from `profiles/`.
+///
+/// Supports an optional `name` field that overrides the filename-derived
+/// profile name. This is necessary for names containing characters that are
+/// invalid in filenames (e.g. colons on Windows): the file can be named
+/// `ha-auto_fast.toml` and set `name = "ha-auto:fast"` inside.
+#[derive(Debug, Deserialize)]
+struct ProfileFile {
+    /// Explicit profile name. When absent, the file stem is used.
+    #[serde(default)]
+    name: Option<String>,
+    /// All remaining fields are deserialized as `ProfileConfig`.
+    #[serde(flatten)]
+    config: ProfileConfig,
+}
+
 /// Top-level gateway configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -270,6 +286,53 @@ impl Config {
         // Serialize back to string and use toml::from_str exclusively (see gotchas.md).
         let merged = toml::to_string(&base).context("re-serializing merged config")?;
         let mut config: Self = toml::from_str(&merged).context("deserializing merged config")?;
+
+        // Layer per-profile files from the profile directory.
+        let config_parent = path.parent().unwrap_or(Path::new("."));
+        let profile_dir = match &config.gateway.profile_dir {
+            Some(dir) => {
+                let p = Path::new(dir);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    config_parent.join(p)
+                }
+            }
+            None => config_parent.join("profiles"),
+        };
+        if profile_dir.is_dir() {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&profile_dir)
+                .with_context(|| {
+                    format!("reading profile directory {}", profile_dir.display())
+                })?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "toml").unwrap_or(false))
+                .collect();
+            entries.sort();
+
+            for entry in &entries {
+                let fallback_name = entry
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_owned())
+                    .with_context(|| format!("invalid profile filename {}", entry.display()))?;
+                let content = std::fs::read_to_string(entry)
+                    .with_context(|| format!("reading profile {}", entry.display()))?;
+                let file: ProfileFile = toml::from_str(&content)
+                    .with_context(|| format!("parsing profile {}", entry.display()))?;
+                let name = file.name.unwrap_or(fallback_name);
+                config.profiles.insert(name, file.config);
+            }
+            if !entries.is_empty() {
+                tracing::info!(
+                    dir = %profile_dir.display(),
+                    count = entries.len(),
+                    "loaded profiles from directory"
+                );
+            }
+        }
+
         config.normalize();
         config.validate()?;
         Ok(config)
@@ -843,5 +906,190 @@ max_auto_tier = "local:fast"
         let mut profiles = HashMap::new();
         profiles.insert("auto".into(), cascade_profile("local:fast", "local:fast", "local:fast"));
         assert!(validate_profile_route_cycles(&profiles).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile directory loading
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn profile_dir_loads_profiles_from_directory() {
+        let uid = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let dir = std::env::temp_dir().join(format!("lmg-test-{uid}"));
+        let profiles_dir = dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+
+        let base_toml = r#"
+[gateway]
+client_port = 8080
+admin_port  = 8081
+traffic_log_capacity = 500
+
+[backends.ollama]
+base_url = "http://localhost:11434"
+
+[[tiers]]
+name    = "local:fast"
+backend = "ollama"
+model   = "qwen2.5:1.5b"
+
+[aliases]
+"hint:fast" = "local:fast"
+"#;
+        let profile_toml = r#"
+mode          = "dispatch"
+classifier    = "local:fast"
+max_auto_tier = "local:fast"
+"#;
+        std::fs::write(dir.join("config.toml"), base_toml).unwrap();
+        std::fs::write(profiles_dir.join("default.toml"), profile_toml).unwrap();
+
+        let config = Config::load(&dir.join("config.toml"))
+            .expect("should load with profile directory");
+        assert!(config.profiles.contains_key("default"));
+        assert_eq!(config.profiles.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_dir_name_override_takes_precedence() {
+        let uid = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let dir = std::env::temp_dir().join(format!("lmg-test-{uid}"));
+        let profiles_dir = dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+
+        let base_toml = r#"
+[gateway]
+client_port = 8080
+admin_port  = 8081
+traffic_log_capacity = 500
+
+[backends.ollama]
+base_url = "http://localhost:11434"
+
+[[tiers]]
+name    = "local:fast"
+backend = "ollama"
+model   = "qwen2.5:1.5b"
+
+[aliases]
+"hint:fast" = "local:fast"
+"#;
+        // File is named "ha-auto_fast.toml" but declares name = "ha-auto:fast"
+        let profile_toml = r#"
+name          = "ha-auto:fast"
+mode          = "dispatch"
+classifier    = "local:fast"
+max_auto_tier = "local:fast"
+"#;
+        // Also need a default profile for validation to pass
+        let default_toml = r#"
+mode          = "dispatch"
+classifier    = "local:fast"
+max_auto_tier = "local:fast"
+"#;
+        std::fs::write(dir.join("config.toml"), base_toml).unwrap();
+        std::fs::write(profiles_dir.join("ha-auto_fast.toml"), profile_toml).unwrap();
+        std::fs::write(profiles_dir.join("default.toml"), default_toml).unwrap();
+
+        let config = Config::load(&dir.join("config.toml"))
+            .expect("should load with name override");
+        assert!(
+            config.profiles.contains_key("ha-auto:fast"),
+            "profile should use name override, got keys: {:?}",
+            config.profiles.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !config.profiles.contains_key("ha-auto_fast"),
+            "filename-derived name should not be used when name override is set"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_dir_overrides_inline_profiles() {
+        let uid = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let dir = std::env::temp_dir().join(format!("lmg-test-{uid}"));
+        let profiles_dir = dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+
+        let base_toml = r#"
+[gateway]
+client_port = 8080
+admin_port  = 8081
+traffic_log_capacity = 500
+
+[backends.ollama]
+base_url = "http://localhost:11434"
+
+[[tiers]]
+name    = "local:fast"
+backend = "ollama"
+model   = "qwen2.5:1.5b"
+
+[aliases]
+"hint:fast" = "local:fast"
+
+[profiles.default]
+mode          = "dispatch"
+classifier    = "local:fast"
+max_auto_tier = "local:fast"
+system_prompt = "inline version"
+"#;
+        let profile_toml = r#"
+mode          = "dispatch"
+classifier    = "local:fast"
+max_auto_tier = "local:fast"
+system_prompt = "directory version"
+"#;
+        std::fs::write(dir.join("config.toml"), base_toml).unwrap();
+        std::fs::write(profiles_dir.join("default.toml"), profile_toml).unwrap();
+
+        let config = Config::load(&dir.join("config.toml"))
+            .expect("should load with directory override");
+        let profile = config.profiles.get("default").unwrap();
+        assert_eq!(
+            profile.system_prompt.as_deref(),
+            Some("directory version"),
+            "directory profile should override inline profile"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profile_dir_is_silently_skipped_when_absent() {
+        let uid = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let dir = std::env::temp_dir().join(format!("lmg-test-{uid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base_toml = r#"
+[gateway]
+client_port = 8080
+admin_port  = 8081
+traffic_log_capacity = 500
+
+[backends.ollama]
+base_url = "http://localhost:11434"
+
+[[tiers]]
+name    = "local:fast"
+backend = "ollama"
+model   = "qwen2.5:1.5b"
+
+[profiles.default]
+mode          = "dispatch"
+classifier    = "local:fast"
+max_auto_tier = "local:fast"
+"#;
+        std::fs::write(dir.join("config.toml"), base_toml).unwrap();
+        // No profiles/ dir created — should not error.
+        let config = Config::load(&dir.join("config.toml"))
+            .expect("should load without profiles dir");
+        assert_eq!(config.profiles.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

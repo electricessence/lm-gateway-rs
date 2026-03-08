@@ -1,0 +1,23 @@
+# "general" — generic smart router for Open WebUI and other LAN clients.
+
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:max"
+classifier_prompt = """\
+Classify this request. Reply with exactly one label.
+
+instant    — greeting, one-word fact, no reasoning needed          (1.7b)
+fast       — simple question with mild uncertainty                 (1.7b + CoT)
+moderate   — explanation, code, analysis, device commands          (7b)
+deep       — complex code, architecture, detailed analysis         (14b)
+max        — hardest problems, multi-step reasoning, design        (14b + CoT)
+
+Reply with one word only: instant, fast, moderate, deep, or max.\
+"""
+system_prompt = """\
+You are a concise and helpful AI assistant.
+- Answer directly without unnecessary preamble or apologies.
+- For code: add brief comments; use idiomatic style for the language.
+- For explanations: match depth to complexity — one sentence for facts, structured detail for concepts.
+- For design and architecture: give concrete recommendations with trade-offs.
+"""

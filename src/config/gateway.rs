@@ -101,6 +101,23 @@ pub struct GatewayConfig {
     /// effectively disable health-based skipping.
     #[serde(default)]
     pub health_error_threshold: Option<f64>,
+
+    /// Directory containing per-profile TOML files.
+    ///
+    /// Each `*.toml` file in this directory is loaded as a [`ProfileConfig`]
+    /// whose name is the file stem (e.g. `ha-auto.toml` → profile `ha-auto`).
+    /// Directory profiles are merged **after** inline `[profiles.*]` sections
+    /// and `conf.d/` overlays, so they take precedence on name collision.
+    ///
+    /// Relative paths are resolved against the parent of the main config file.
+    /// Defaults to `profiles/` next to the config file when unset.
+    ///
+    /// ```toml
+    /// [gateway]
+    /// profile_dir = "profiles"
+    /// ```
+    #[serde(default)]
+    pub profile_dir: Option<String>,
 }
 
 /// A reference to a secret value from one of the supported secret stores.

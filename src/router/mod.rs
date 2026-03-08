@@ -634,6 +634,7 @@ mod tests {
                 health_error_threshold: None,
                 public_profile: None,
                 request_timeout_ms: None,
+                profile_dir: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -751,6 +752,7 @@ mod tests {
                 health_error_threshold: None,
                 public_profile: None,
                 request_timeout_ms: None,
+                profile_dir: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -903,6 +905,7 @@ mod tests {
                     health_error_threshold: None,
                     public_profile: None,
                     request_timeout_ms: None,
+                    profile_dir: None,
                 },
                 backends: std::collections::HashMap::new(),
                 tiers: vec![],

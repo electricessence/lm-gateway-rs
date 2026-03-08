@@ -1,0 +1,38 @@
+# "claw-agent" — profile for AI agents (100% local processing)
+#
+# Agents generate tool calls, code, SSH commands, config edits, and multi-step
+# plans. The classifier routes by cognitive load:
+#   instant  — acks, status pings, simple tool calls (list files, echo)
+#   fast     — single-tool invocations, short answers with mild reasoning
+#   moderate — code generation, config edits, multi-tool sequences
+#   deep     — architecture decisions, complex debugging, long code blocks
+#   max      — hardest: multi-file refactors, design docs, failure analysis
+#
+# max_auto_tier capped at local:moderate — 14b model causes 408 timeouts
+# on 5.8 GB RAM (qwen3:14b-q3_K_M loads too slowly). Revisit when RAM is
+# upgraded or a lighter 14b quant is available.
+
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:moderate"
+classifier_prompt = """\
+Classify this AI agent request by cognitive load. Reply with exactly one label.
+
+instant    — acknowledgment, status check, trivial tool call                  (1.7b)
+fast       — single tool invocation, short factual answer, simple lookup      (1.7b + CoT)
+moderate   — code generation, config edit, shell script, multi-tool call      (7b)
+deep       — complex debugging, architecture analysis, long code blocks       (14b)
+max        — multi-file refactor, system design, failure root-cause           (14b + CoT)
+
+Examples:
+  List files in /tmp                    -> instant
+  What is my IP address?                -> instant
+  Check if nginx is running             -> fast
+  Read and summarize this config file   -> fast
+  Write a bash script to backup logs    -> moderate
+  Edit the docker-compose to add a vol  -> moderate
+  Debug why the build fails on step 3   -> deep
+  Refactor the auth module into 3 files -> max
+
+Reply with one word only: instant, fast, moderate, deep, or max.\
+"""

@@ -1,6 +1,6 @@
 # LM Gateway — Configuration Guide
 
-Everything in lm-gateway-rs is configured through a single TOML file (plus optional `conf.d/` overlays). This guide walks through each section, explains what it does, and shows how the pieces connect.
+Everything in lm-gateway-rs is configured through a single TOML file (plus optional `conf.d/` overlays and a `profiles/` directory for per-profile files). This guide walks through each section, explains what it does, and shows how the pieces connect.
 
 ---
 
@@ -364,6 +364,45 @@ Place `*.toml` files in a `conf.d/` directory next to your `config.toml`. They a
 Merge rules:
 - `[backends.*]`, `[gateway]`, `[profiles.*]` → key-level: overlay wins per key
 - `[[tiers]]`, `[[clients]]` → same `name` = replaced in-place; new `name` = appended
+
+---
+
+## `profiles/` — Per-Profile Files
+
+Place `*.toml` files in a `profiles/` directory next to your `config.toml`. Each file defines a single routing profile — the filename (without `.toml`) becomes the profile name.
+
+```
+/etc/lm-gateway/
+  config.toml
+  profiles/
+    ha-auto.toml           ← profile "ha-auto"
+    ha-auto_fast.toml      ← name = "ha-auto:fast" (override inside file)
+    general.toml           ← profile "general"
+    default.toml           ← profile "default"
+```
+
+**File format:** each file contains the same fields as a `[profiles.*]` section, without the `[profiles.name]` wrapper:
+
+```toml
+# profiles/general.toml
+mode          = "classify"
+classifier    = "local:instant"
+max_auto_tier = "local:max"
+classifier_prompt = "..."
+```
+
+**Name override:** when the profile name contains characters invalid in filenames (e.g. colons on Windows), add `name = "ha-auto:fast"` inside the file. This takes precedence over the filename.
+
+**Load order:** profile files are loaded after inline `[profiles.*]` and `conf.d/` overlays. On name collision, directory profiles win.
+
+**Custom path:** override the directory with `profile_dir` in `[gateway]`:
+
+```toml
+[gateway]
+profile_dir = "/opt/lm-gateway/profiles"
+```
+
+When neither `profile_dir` nor a `profiles/` directory exists, this feature is silently skipped.
 
 ---
 
