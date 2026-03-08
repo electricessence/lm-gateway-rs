@@ -100,7 +100,7 @@ max_context_tokens = 32768
 "hint:max"       = "local:max"
 
 # Agent alias — "auto" resolves to the classifier entry tier.
-# The claw-agent profile handles actual routing via classification.
+# The agent profile handles actual routing via classification.
 "auto"           = "local:instant"
 "auto:latest"    = "local:instant"
 

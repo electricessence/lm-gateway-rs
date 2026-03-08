@@ -213,7 +213,7 @@ max_auto_tier = "local:deep"     # all requests go here
 mode          = "escalate"
 classifier    = "local:fast"
 max_auto_tier = "cloud:deep"
-expert_requires_flag = true      # clients must set X-Claw-Expert: true for max tier
+expert_requires_flag = true      # clients must set X-LMG-Expert: true for max tier
 ```
 
 #### `classify` — fast pre-flight, smart routing

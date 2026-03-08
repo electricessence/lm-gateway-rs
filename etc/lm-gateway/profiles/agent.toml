@@ -4,35 +4,45 @@
 # plans. The classifier routes by cognitive load:
 #   instant  — acks, status pings, simple tool calls (list files, echo)
 #   fast     — single-tool invocations, short answers with mild reasoning
-#   moderate — code generation, config edits, multi-tool sequences
-#   deep     — architecture decisions, complex debugging, long code blocks
-#   max      — hardest: multi-file refactors, design docs, failure analysis
+#   moderate — anything requiring real work: code gen, debugging, analysis
 #
 # max_auto_tier capped at local:moderate — 14b model causes 408 timeouts
 # on 5.8 GB RAM (qwen3:14b-q3_K_M loads too slowly). Revisit when RAM is
 # upgraded or a lighter 14b quant is available.
+#
+# NOTE: Only 3 labels used (not 5). The 1.7b classifier cannot reliably
+# distinguish deep/max from fast. Since the cap is moderate anyway, we
+# collapse everything above fast into "moderate" for higher accuracy.
 
 mode              = "classify"
 classifier        = "local:instant"
 max_auto_tier     = "local:moderate"
 classifier_prompt = """\
-Classify this AI agent request by cognitive load. Reply with exactly one label.
+Classify this AI agent request. Reply with exactly one word.
 
-instant    — acknowledgment, status check, trivial tool call                  (1.7b)
-fast       — single tool invocation, short factual answer, simple lookup      (1.7b + CoT)
-moderate   — code generation, config edit, shell script, multi-tool call      (7b)
-deep       — complex debugging, architecture analysis, long code blocks       (14b)
-max        — multi-file refactor, system design, failure root-cause           (14b + CoT)
+instant  — one-liner: status check, trivial command, acknowledgment
+fast     — short answer, single lookup, simple factual question
+moderate — everything else: code, scripts, debugging, config, analysis, design, multi-step
+
+If in doubt between fast and moderate, pick moderate.
 
 Examples:
-  List files in /tmp                    -> instant
-  What is my IP address?                -> instant
-  Check if nginx is running             -> fast
-  Read and summarize this config file   -> fast
-  Write a bash script to backup logs    -> moderate
-  Edit the docker-compose to add a vol  -> moderate
-  Debug why the build fails on step 3   -> deep
-  Refactor the auth module into 3 files -> max
+  List files in /tmp                          -> instant
+  What is my IP address?                      -> instant
+  Echo hello world                            -> instant
+  Show current date and time                  -> instant
+  What does the -r flag do in cp?             -> fast
+  What port does SSH use by default?          -> fast
+  Check if nginx is running                   -> fast
+  Read /etc/hostname and tell me what it says -> fast
+  Write a bash script to rotate log files     -> moderate
+  Edit the docker-compose to add a volume     -> moderate
+  Create a systemd service file               -> moderate
+  Debug why my program panics at unwrap       -> moderate
+  Analyze this microservices architecture     -> moderate
+  Refactor auth into separate files           -> moderate
+  Design a CI/CD pipeline                     -> moderate
+  Write a PowerShell function for disk usage  -> moderate
 
-Reply with one word only: instant, fast, moderate, deep, or max.\
+Reply with one word only: instant, fast, or moderate.\
 """

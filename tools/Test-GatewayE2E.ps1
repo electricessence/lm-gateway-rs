@@ -62,7 +62,8 @@ if (-not $AdminToken)  { throw 'Set LMG_ADMIN_TOKEN env var or pass -AdminToken'
 if (-not $AdminUrl) {
     $AdminUrl = ($GatewayUrl -replace ':8080', ':8081' -replace '/v1.*', '').TrimEnd('/')
 }
-$clientBase = $GatewayUrl.TrimEnd('/')
+# Normalize: strip any trailing /v1 path so Send-ChatRequest can always append /v1/...
+$clientBase = ($GatewayUrl -replace '/v1/?$', '').TrimEnd('/')
 $adminBase  = $AdminUrl.TrimEnd('/')
 
 Write-Host "`n========================================" -ForegroundColor Cyan

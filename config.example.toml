@@ -166,7 +166,7 @@ model   = "anthropic/claude-opus-4-5"
 mode               = "dispatch"       # "dispatch" | "escalate" | "classify"
 classifier         = "local:fast"     # tier used for intent classification (dispatch mode)
 max_auto_tier      = "cloud:fast"     # ceiling before expert_requires_flag kicks in
-expert_requires_flag = true           # client must set X-Claw-Expert: true to reach expert tier
+expert_requires_flag = true           # client must set X-LMG-Expert: true to reach expert tier
 # rate_limit_rpm = 120               # total RPM shared by ALL clients on this profile
 
 # Escalate profile — tries cheap first, steps up if response is insufficient

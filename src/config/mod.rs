@@ -305,7 +305,17 @@ impl Config {
                 .with_context(|| {
                     format!("reading profile directory {}", profile_dir.display())
                 })?
-                .filter_map(|e| e.ok())
+                .filter_map(|e| match e {
+                    Ok(entry) => Some(entry),
+                    Err(err) => {
+                        tracing::warn!(
+                            dir = %profile_dir.display(),
+                            error = %err,
+                            "failed to read profile directory entry"
+                        );
+                        None
+                    }
+                })
                 .map(|e| e.path())
                 .filter(|p| p.extension().map(|x| x == "toml").unwrap_or(false))
                 .collect();
@@ -374,8 +384,12 @@ impl Config {
             );
         }
 
-        // Every profile classifier must be a known tier
+        // Every profile classifier must be a known tier (reply-mode profiles
+        // don't use a classifier, so skip them).
         for (name, profile) in &self.profiles {
+            if profile.mode == RoutingMode::Reply {
+                continue;
+            }
             anyhow::ensure!(
                 tier_names.contains(profile.classifier.as_str()),
                 "profile `{}` classifier references unknown tier `{}`",
