@@ -74,9 +74,11 @@ pub struct ProfileConfig {
 
     /// Fallback tier used when the model hint does not match any known tier or alias.
     /// In `classify` mode, this tier is also used for the pre-flight classification call.
+    #[serde(default)]
     pub classifier: String,
 
     /// Highest tier auto-escalation can reach without an explicit override.
+    #[serde(default)]
     pub max_auto_tier: String,
 
     /// If true, the `cloud:expert` tier (or highest tier) requires an explicit
@@ -96,7 +98,7 @@ pub struct ProfileConfig {
     /// System prompt used by `classify` mode to ask the classifier tier for a
     /// routing label. The user message is appended verbatim after this prompt.
     ///
-    /// Respond should be exactly one of: `simple`, `moderate`, or `complex`.
+    /// The classifier responds with one word (e.g. `instant`, `fast`, `deep`).
     /// Defaults to [`DEFAULT_CLASSIFIER_PROMPT`] if not set.
     #[serde(default)]
     pub classifier_prompt: Option<String>,
@@ -161,14 +163,20 @@ pub struct ProfileConfig {
     /// ```
     #[serde(default)]
     pub class_prompts: HashMap<String, String>,
+
+    /// Static response text returned by `reply` mode without calling any backend.
+    ///
+    /// Defaults to a generic "not configured" message when absent.
+    #[serde(default)]
+    pub reply_message: Option<String>,
 }
 
 /// Default classification prompt injected as the system message for `classify` mode.
 ///
 /// Returns one of `instant`, `fast`, or `deep` — the router maps these to the
 /// first, middle, and last tier in the profile's auto range respectively.
-/// These labels are also accepted as synonyms for the legacy `simple`/`moderate`/`complex`
-/// vocabulary, so existing configs continue to work unchanged.
+/// The label vocabulary is defined by the prompt — override per-profile via
+/// `classifier_prompt` to use any labels your workload needs.
 ///
 /// This is the v16 prompt (27/27 on a 27-case HA benchmark against qwen3:1.7b).
 /// Expanded from v10 with explicit multi-device + polite-combo instant examples
@@ -221,11 +229,19 @@ pub enum RoutingMode {
     /// Make a fast pre-flight call to the `classifier` tier to determine request
     /// complexity, then dispatch to the appropriate tier.
     ///
-    /// The classifier responds with one word (`simple`, `moderate`, or `complex`),
-    /// which is mapped to the first, middle, or last tier in the profile's auto
-    /// range (up to `max_auto_tier`). Adds ~200–600 ms latency before the main
+    /// The classifier responds with one word (e.g. `instant`, `fast`, `deep`),
+    /// which is mapped to the appropriate tier in the profile's auto range
+    /// (up to `max_auto_tier`). Adds ~200–600 ms latency before the main
     /// inference call begins.
     Classify,
+
+    /// Return a static response without calling any backend.
+    ///
+    /// The response text comes from [`ProfileConfig::reply_message`] (or a
+    /// default). Useful as a dead-end for overflow/escalation profiles that
+    /// are not yet wired to a backend — the profile can later be reconfigured
+    /// to `classify` or `dispatch` when cloud models are added.
+    Reply,
 }
 
 impl std::fmt::Display for RoutingMode {
@@ -234,6 +250,7 @@ impl std::fmt::Display for RoutingMode {
             Self::Dispatch => "dispatch",
             Self::Escalate => "escalate",
             Self::Classify => "classify",
+            Self::Reply => "reply",
         })
     }
 }

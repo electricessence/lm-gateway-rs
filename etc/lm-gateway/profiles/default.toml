@@ -1,0 +1,16 @@
+# "default" — fallback for unauthenticated /v1/chat/completions requests.
+
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:max"
+classifier_prompt = """\
+Classify this request. Reply with exactly one label.
+
+instant    — greeting, one-word fact, no reasoning needed          (1.7b)
+fast       — simple question with mild uncertainty                 (1.7b + CoT)
+moderate   — explanation, code, analysis, device commands          (7b)
+deep       — complex code, architecture, detailed analysis         (14b)
+max        — hardest problems, multi-step reasoning, design        (14b + CoT)
+
+Reply with one word only: instant, fast, moderate, deep, or max.\
+"""

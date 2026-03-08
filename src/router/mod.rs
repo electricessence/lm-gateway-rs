@@ -1,6 +1,6 @@
 //! Request routing logic — the brain of lm-gateway.
 //!
-//! Three routing modes are supported:
+//! Four routing modes are supported:
 //!
 //! - **Dispatch** (`RoutingMode::Dispatch`): the `model` field in the request is
 //!   resolved through aliases and tier names to a target tier, then forwarded
@@ -17,6 +17,10 @@
 //!   or `complex`), which is mapped to the first, middle, or last tier in the
 //!   profile's auto range. The main inference call is then dispatched to that tier.
 //!   Adds ~200–600 ms latency from the classification call.
+//!
+//! - **Reply** (`RoutingMode::Reply`): returns a static response without calling
+//!   any backend. Useful as a dead-end for overflow profiles that are not yet wired
+//!   to a model.
 
 use std::{
     collections::HashMap,
@@ -25,6 +29,7 @@ use std::{
 };
 
 use anyhow::Context;
+use bytes::Bytes;
 use serde_json::Value;
 use tracing::debug;
 
@@ -291,6 +296,25 @@ pub async fn route(
         .profile(profile_name)
         .context("no matching profile and no default profile configured")?;
 
+    // Reply mode: return a static response without resolving tiers or calling backends.
+    if profile.mode == RoutingMode::Reply {
+        let model_hint = request_body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let msg = profile.reply_message.as_deref().unwrap_or(DEFAULT_REPLY_MESSAGE);
+        let mut entry = TrafficEntry::new("reply".into(), "none".into(), 0, false)
+            .with_profile(profile_name)
+            .with_requested_model(&model_hint)
+            .with_routing_mode("reply");
+        if let Some(id) = request_id {
+            entry = entry.with_id(id);
+        }
+        entry = entry.with_priority(priority);
+        state.traffic.push(entry.clone());
+        return Ok((build_reply_response(msg), entry));
+    }
+
     let (mut target_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
 
@@ -329,6 +353,7 @@ pub async fn route(
         RoutingMode::Classify => {
             classify_and_dispatch(state, &mut request_body, profile_name, priority, stream).await?
         }
+        RoutingMode::Reply => unreachable!("reply mode handled above"),
     };
 
     // Enrich entry with request-level context only available at route() scope,
@@ -340,6 +365,7 @@ pub async fn route(
             RoutingMode::Dispatch => "dispatch",
             RoutingMode::Escalate => "escalate",
             RoutingMode::Classify => "classify",
+            RoutingMode::Reply => "reply",
         });
     if let Some(id) = request_id {
         entry = entry.with_id(id);
@@ -374,6 +400,26 @@ pub async fn route_stream(
     let profile = config
         .profile(profile_name)
         .context("no matching profile and no default profile configured")?;
+
+    // Reply mode: return a synthetic SSE stream without resolving tiers or calling backends.
+    if profile.mode == RoutingMode::Reply {
+        let model_hint = request_body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        let msg = profile.reply_message.as_deref().unwrap_or(DEFAULT_REPLY_MESSAGE);
+        let stream = build_reply_sse_stream(msg);
+        let mut entry = TrafficEntry::new("reply".into(), "none".into(), 0, true)
+            .with_profile(profile_name)
+            .with_requested_model(&model_hint)
+            .with_routing_mode("reply");
+        if let Some(id) = request_id {
+            entry = entry.with_id(id);
+        }
+        entry = entry.with_priority(priority);
+        state.traffic.push(entry.clone());
+        return Ok((stream, entry, false));
+    }
 
     let (mut resolved_tier, model_hint) =
         resolve_target_tier(&config, profile, &request_body, expert_gate)?;
@@ -509,6 +555,51 @@ pub async fn route_stream(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Default message returned by reply-mode profiles when no custom message is set.
+const DEFAULT_REPLY_MESSAGE: &str =
+    "This request cannot be processed. No backend is configured for this profile.";
+
+/// Build a synthetic OpenAI-format `chat.completion` response for reply mode.
+///
+/// Returns a [`Value`] that looks exactly like a real completion — the caller
+/// (agent, client) can parse it without special-casing the reply path.
+fn build_reply_response(msg: &str) -> Value {
+    serde_json::json!({
+        "id": "reply",
+        "object": "chat.completion",
+        "model": "reply",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": msg },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+    })
+}
+
+/// Build a synthetic SSE stream for reply mode (streaming callers).
+///
+/// Emits a single `chat.completion.chunk` followed by `[DONE]`, matching
+/// the OpenAI streaming wire format so the consumer never knows it wasn't
+/// a real backend response.
+fn build_reply_sse_stream(msg: &str) -> SseStream {
+    let chunk = serde_json::json!({
+        "id": "reply",
+        "object": "chat.completion.chunk",
+        "model": "reply",
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": msg },
+            "finish_reason": "stop"
+        }]
+    });
+    let payload = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+    let stream = futures_util::stream::once(async move {
+        Ok(Bytes::from(payload))
+    });
+    Box::pin(stream)
+}
+
 /// Prepend the profile system prompt into the request's messages array.
 ///
 /// If the first message already has `role = "system"`, the profile prompt is
@@ -634,6 +725,7 @@ mod tests {
                 health_error_threshold: None,
                 public_profile: None,
                 request_timeout_ms: None,
+                profile_dir: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -751,6 +843,7 @@ mod tests {
                 health_error_threshold: None,
                 public_profile: None,
                 request_timeout_ms: None,
+                profile_dir: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -903,6 +996,7 @@ mod tests {
                     health_error_threshold: None,
                     public_profile: None,
                     request_timeout_ms: None,
+                    profile_dir: None,
                 },
                 backends: std::collections::HashMap::new(),
                 tiers: vec![],

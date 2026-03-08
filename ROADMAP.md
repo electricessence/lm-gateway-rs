@@ -346,6 +346,72 @@ Cascade: `X-LMG-Profile: auto → code-auto` / `X-LMG-Class: class=code; complex
 
 ---
 
+### Thinking messages — perceived performance for slow tiers
+
+When a streaming request routes to a slow tier (deep, max), inject a brief acknowledgment
+into the SSE stream *immediately* — before the backend's first token arrives. This eliminates
+the dead silence during 10-30s model loads.
+
+**Decision:** Experiments showed that generating dynamic prefixes via the 1.7b instant model
+produces either over-specific echoes (repeating the user's words) or collapses to a single
+repeated phrase. A static message pool per tier, randomly selected, is simpler, zero-latency,
+and produces better UX.
+
+**Predictive, not reactive.** The gateway knows the tier after classification. If that tier
+has thinking messages configured, inject *immediately* — don't wait for a timeout. The model
+*will* be slow; there's no reason to delay the acknowledgment.
+
+**How it works:**
+
+1. Request arrives with `stream: true` and routes to a tier that has thinking messages configured
+2. Gateway immediately emits a randomly-selected message from the tier's pool
+   (or the profile default) as synthetic `chat.completion.chunk` SSE events followed by `\n\n`
+3. In parallel, the backend request proceeds normally
+4. When the real backend tokens start flowing, continue the stream naturally
+
+The user sees: `"Let me think about that..."` → [real response]
+
+**Only for streaming requests.** Non-streaming clients (like Home Assistant) receive the
+complete response — injecting prefix text would pollute the answer. The `stream: true` flag
+gates this feature.
+
+**Profile config:**
+
+```toml
+# Profile-level default (applies to any tier without a specific override)
+thinking_message = "One moment..."
+
+# Per-tier message pools (randomly selected; override the default)
+[thinking_messages]
+"local:deep" = [
+    "That's a good one — bear with me.",
+    "Let me think on that.",
+    "Give me a moment to work through this.",
+]
+"local:max" = [
+    "This will take a moment...",
+    "Working through something complex.",
+    "Let me dig into that for you.",
+]
+```
+
+**Design principles:**
+- Predictive injection — emit immediately based on tier, not on a timeout
+- Opt-in per profile — agent profiles that make silent tool calls don't get it
+- Fast tiers (instant, fast) typically don't need it — they respond in <2s
+- Non-streaming requests (`stream: false`) are unaffected — prefix only applies to SSE streams
+- The injected text becomes part of the response content (SSE is append-only)
+- Per-tier overrides let deeper tiers signal more effort ("thinking" vs "got it")
+
+**What changes in code (~80 lines new Rust):**
+
+- `config/profile.rs`: add `thinking_message`, `thinking_messages` (HashMap<String, Vec<String>>)
+- `router/mod.rs`: in `route_stream()`, if the resolved tier has a thinking message,
+  prepend synthetic SSE chunks before the backend stream
+- `backends/mod.rs`: no change — the wrapping happens at the router level
+
+---
+
 ## Medium Range
 
 ### TLS for the admin port
@@ -449,6 +515,44 @@ Explore options for accessing more capable models within the 17.6 GiB Vulkan VRA
 - **Offloading**: partial GPU + CPU offload (`num_gpu = N` layers) for a 14b+ model — slow but functional for deep-tier requests where latency is less critical
 - **External backends**: route deep-tier to a cloud provider (Anthropic, OpenRouter) for tasks that genuinely need 70b+ capability; the gateway already supports this via backend config
 - **Hardware upgrade**: a dedicated GPU card in the Proxmox host would provide a separate VRAM pool; even a used 16 GB card would double available capacity
+
+### Classifier auto-tuning routine
+
+An automated calibration procedure that tunes classifier prompts and tier boundaries to the
+operator's specific model inventory. When an operator installs lm-gateway-rs and configures
+multiple tiers, a built-in `auto-tune` profile can iteratively optimise classification accuracy
+without manual prompt engineering.
+
+**How it works:**
+
+1. **Discovery**: the auto-tuner inspects the config — what models are available, how many
+   tiers are defined, what latency and capability characteristics each tier has.
+2. **Synthetic benchmark**: generate a representative prompt set spanning trivial → complex
+   difficulty levels. Send each through the classifier and record: classified tier, actual
+   response quality, latency, and token usage.
+3. **Evaluate**: compute accuracy (did the classifier route to the optimal tier?),
+   overclassification rate (wasted expensive model time), and underclassification rate
+   (weaker model than needed). Measure per-tier breakdown.
+4. **Adjust**: based on the results, the auto-tuner modifies the classifier prompt —
+   adjusting label descriptions, adding/removing examples, simplifying label count if the
+   model can't distinguish fine-grained tiers. It may also recommend merging tiers or
+   adjusting `max_auto_tier`.
+5. **Repeat**: run the benchmark again with the new prompt. Loop until accuracy stabilises
+   or a maximum iteration count is reached.
+6. **Output**: write the optimised classifier prompt and recommended config changes to a
+   report file. Optionally update the profile TOML directly (with operator approval).
+
+**Key principles:**
+- The auto-tuner uses the gateway's own routing infrastructure — no external tools needed
+- Works with any model inventory — adapts label count to what the classifier can handle
+- The procedure is an agentic loop: a set of instructions any AI agent (or human) can follow
+- Results are reproducible — same models + same prompt set = same accuracy score
+- Never destructive — reports recommendations; doesn't overwrite config without approval
+
+**Trigger scenarios:**
+- First install with multiple models → "Run `auto-tune` to optimise routing"
+- Adding a new model tier → re-tune to include the new tier in classification
+- Swapping a model (e.g. upgrading from 7b to 14b) → re-tune boundaries
 
 ---
 

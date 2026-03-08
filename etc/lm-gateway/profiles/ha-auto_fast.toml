@@ -1,0 +1,70 @@
+# "ha-auto:fast" — same classifier as ha-auto, capped at local:moderate.
+# max_auto_tier does the downscaling — classifier sees all 3 tiers, gateway clamps.
+#
+# Trade-off: ~2s warm responses at some accuracy cost vs ha-auto.
+#
+# The `name` field overrides the filename-derived name because colons are
+# invalid in Windows filenames.
+name              = "ha-auto:fast"
+
+mode              = "classify"
+classifier        = "local:instant"
+max_auto_tier     = "local:moderate"
+classifier_prompt = """\
+Classify this Home Assistant voice command into exactly one tier.
+
+fast     — greeting, chitchat, joke, general knowledge, or simple command without a named entity
+moderate — single device command with a clearly named entity or area
+deep     — status query, multi-device command, scene, routine, or arrival/departure trigger
+
+  Hi                                                       -> fast
+  Hello                                                    -> fast
+  Hey                                                      -> fast
+  How are you                                              -> fast
+  Good morning                                             -> fast
+  Tell me a joke                                           -> fast
+  What's the capital of France?                            -> fast
+  What model are you?                                      -> fast
+  What time is it?                                         -> fast
+  Thank you                                                -> fast
+  Turn on the light                                        -> fast
+  Turn off the light                                       -> fast
+  Lock up                                                  -> fast
+  Never mind                                               -> fast
+  Turn on the office light                                 -> moderate
+  Turn off the kitchen light                               -> moderate
+  Lock the front door                                      -> moderate
+  Unlock the back door                                     -> moderate
+  Turn off the TV                                          -> moderate
+  Set the thermostat to 72                                 -> moderate
+  Dim the bedroom light to 50%                             -> moderate
+  Play music in the living room                            -> moderate
+  Open the garage door                                     -> moderate
+  Close the blinds in the bedroom                          -> moderate
+  Set the living room light to blue                        -> moderate
+  Is the front door locked?                                -> deep
+  Is the garage door open?                                 -> deep
+  What is the living room temperature?                     -> deep
+  Are any lights on downstairs?                            -> deep
+  What lights are still on?                                -> deep
+  Are all the doors locked?                                -> deep
+  Turn off all the lights                                  -> deep
+  Turn on everything in the kitchen                        -> deep
+  Goodnight                                                -> deep
+  I'm home                                                 -> deep
+  I'm leaving                                              -> deep
+
+Reply with one word: fast, moderate, or deep.\
+"""
+system_prompt = """\
+You are a Home Assistant voice controller. Execute commands via tools; confirm briefly.
+
+- Match entity names exactly from the provided list. Pick the closest match for ambiguous requests.
+- Multiple matches (e.g. two office lights): call the tool once per entity.
+- "lock" / "lock up" = HassTurnOn(domain=lock). "unlock" = HassTurnOff(domain=lock).
+- Door names: "front door" may be a contact sensor (open/closed); "front door lock" is the lock entity. Use the lock entity for lock/unlock commands and lock status queries.
+- State queries: call the tool, answer in one sentence.
+- Automation toggle: use the tool, confirm. Creating automations needs the HA UI.
+- Off-topic questions: answer in one sentence from general knowledge.
+- No entity match: ask one short clarifying question.\
+"""

@@ -1,0 +1,15 @@
+# "agent-escalate" — dead-end profile for agent overflow requests
+#
+# When the agent profile cannot handle a request locally (e.g. the
+# classified tier exceeds the local capacity), it cascades here.
+# This profile returns a canned rejection instead of calling any backend.
+#
+# Future: replace mode = "reply" with mode = "dispatch" and point at a
+# cloud backend (Anthropic, OpenAI) when configured.
+
+mode          = "reply"
+reply_message = """\
+I'm unable to process this request right now — no cloud backend is configured \
+for overflow. Please try simplifying your request or breaking it into smaller \
+steps so it can be handled locally.\
+"""

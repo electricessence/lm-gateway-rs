@@ -78,3 +78,13 @@ Full PowerShell quality standards → `.github/instructions/powershell.instructi
 See `.github/instructions/phased-commit.instructions.md` for the full procedure.
 
 **Summary:** Stage → Critical Review → Security Audit → Commit → **await explicit push approval** → request fresh Copilot review if resolving PR comments.
+
+---
+
+## Config Deploy Discipline
+
+Config files deployed to production (`etc/lm-gateway/config.toml`) must **always** originate from the repo. Never edit the live server config without the change being in the repo first.
+
+- **Stage immediately** after any config change that will be deployed — even if not ready to commit yet. This prevents accidental loss during future syncs.
+- **Deploy from repo** — `Sync-LmGateway.ps1` pushes repo files to LXC. The repo is the source of truth.
+- **Profile deletion = explicit intent** — removing a profile section from the config requires a clear justification (not an accidental side-effect of a large rewrite).

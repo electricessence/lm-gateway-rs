@@ -91,7 +91,7 @@ pub async fn chat_completions_ollama(
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     let expert_gate = headers
-        .get("x-claw-expert")
+        .get("x-lmg-expert")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);

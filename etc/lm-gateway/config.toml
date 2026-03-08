@@ -27,6 +27,9 @@ base_url    = "http://127.0.0.1:11434"
 # (model load can take 30–90 s) and avoids the 30-second default cutoff.
 # Streaming requests use a separate no-timeout client and are unaffected.
 timeout_ms  = 300000
+# Expand Ollama's default context window (2048) so the gateway's
+# max_context_tokens limits are actually usable by the model.
+default_options = { num_ctx = 32768 }
 
 # ---------------------------------------------------------------------------
 # Tiers — ordered by cost/latency (cheapest first)
@@ -41,34 +44,39 @@ timeout_ms  = 300000
 # The classifier's "-think" suffix injects think=true on the elected tier.
 # ---------------------------------------------------------------------------
 [[tiers]]
-name    = "local:instant"
-backend = "ollama"
-model   = "qwen3:1.7b"
-think   = false
+name               = "local:instant"
+backend            = "ollama"
+model              = "qwen3:1.7b"
+think              = false
+max_context_tokens = 4096
 
 [[tiers]]
-name    = "local:fast"
-backend = "ollama"
-model   = "qwen3:1.7b"
-think   = true
+name               = "local:fast"
+backend            = "ollama"
+model              = "qwen3:1.7b"
+think              = true
+max_context_tokens = 4096
 
 [[tiers]]
-name    = "local:moderate"
-backend = "ollama"
-model   = "qwen2.5:7b-instruct"
-think   = false
+name               = "local:moderate"
+backend            = "ollama"
+model              = "qwen2.5:7b-instruct"
+think              = false
+max_context_tokens = 8192
 
 [[tiers]]
-name    = "local:deep"
-backend = "ollama"
-model   = "qwen3:14b-q3_K_M"
-think   = false
+name               = "local:deep"
+backend            = "ollama"
+model              = "qwen3:14b-q3_K_M"
+think              = false
+max_context_tokens = 16384
 
 [[tiers]]
-name    = "local:max"
-backend = "ollama"
-model   = "qwen3:14b-q3_K_M"
-think   = true
+name               = "local:max"
+backend            = "ollama"
+model              = "qwen3:14b-q3_K_M"
+think              = true
+max_context_tokens = 32768
 
 # ---------------------------------------------------------------------------
 # Aliases — map Ollama model names (as sent by clients) to gateway tiers
@@ -91,6 +99,11 @@ think   = true
 "hint:deep"      = "local:deep"
 "hint:max"       = "local:max"
 
+# Agent alias — "auto" resolves to the classifier entry tier.
+# The agent profile handles actual routing via classification.
+"auto"           = "local:instant"
+"auto:latest"    = "local:instant"
+
 # ---------------------------------------------------------------------------
 # Clients — API key → profile bindings (keys loaded from env vars)
 # ---------------------------------------------------------------------------
@@ -99,221 +112,14 @@ think   = true
 key_env = "LMG_HA_KEY"
 profile = "ha-auto"
 
+[[clients]]
+key_env = "LMG_AGENT_KEY"
+profile = "agent"
+
 # ---------------------------------------------------------------------------
-# Profiles — these are the "models" Ollama clients see in /api/tags
+# Profiles — loaded from etc/lm-gateway/profiles/*.toml
+#
+# Each *.toml file in the profiles/ directory is a standalone profile config.
+# The filename becomes the profile name (e.g. ha-auto.toml → "ha-auto"),
+# unless the file contains an explicit `name = "..."` override.
 # ---------------------------------------------------------------------------
-
-# "ha-auto:latest" — what Home Assistant sees and uses.
-#
-# 6-label semantic classify: qwen3:1.7b pre-flight identifies intent before routing.
-#   greeting     — pure social (Hi/bye/thanks/Goodnight)          → qwen3:1.7b no-think
-#   chitchat     — off-topic general knowledge or humor            → qwen3:1.7b + think
-#   command      — any action request (named or unnamed target)    → qwen2.5:7b
-#   conversation — reply to a prior model question (disambiguation) → qwen2.5:7b
-#   inquiry      — state query (is X on/locked/open?)              → qwen3:14b
-#   other        — catch-all: unrecognised or ambiguous            → qwen3:14b
-[profiles.ha-auto]
-mode              = "classify"
-classifier        = "local:instant"
-# classifier_think = true    # uncomment to enable CoT for the pre-flight call
-max_auto_tier     = "local:deep"
-classifier_prompt = """\
-Classify this Home Assistant voice command. Reply with ONLY: class=<label>
-
-greeting     — Hi, thanks, bye, good morning/evening/night (social, no home action)
-chitchat     — joke, trivia, general knowledge question, off-topic
-command      — any action request, with or without a named device or area
-conversation — one-word or short reply to a prior assistant question
-inquiry      — state query about a specific device or area
-other        — unclear, complex, or doesn't fit any category above
-
-Examples:
-  Hi                               ->  class=greeting
-  Good morning                     ->  class=greeting
-  Thank you                        ->  class=greeting
-  Bye                              ->  class=greeting
-  Goodnight                        ->  class=greeting
-  Good evening                     ->  class=greeting
-  Tell me a joke                   ->  class=chitchat
-  What's the capital of France?    ->  class=chitchat
-  What's the capital of Brazil?    ->  class=chitchat
-  Turn on the light                ->  class=command
-  Turn off the fan                 ->  class=command
-  Lock up                          ->  class=command
-  Turn on the office light         ->  class=command
-  Turn off the kitchen light       ->  class=command
-  Lock the front door              ->  class=command
-  Set the thermostat to 72         ->  class=command
-  Dim the bedroom light to 50%     ->  class=command
-  Yes                              ->  class=conversation
-  No                               ->  class=conversation
-  The bedroom one                  ->  class=conversation
-  All of them                      ->  class=conversation
-  Is the front door locked?        ->  class=inquiry
-  Is the garage door open?         ->  class=inquiry
-  Are all the doors locked?        ->  class=inquiry
-  What lights are still on?        ->  class=inquiry
-  What is the garage door's state? ->  class=inquiry
-
-Reply with ONLY the tag. No explanation.\
-"""
-
-[[profiles.ha-auto.rules]]
-when     = { class = "greeting" }
-route_to = "local:instant"
-priority = 100
-
-[[profiles.ha-auto.rules]]
-when     = { class = "chitchat" }
-route_to = "local:fast"
-priority = 90
-
-[[profiles.ha-auto.rules]]
-when     = { class = "command" }
-route_to = "local:moderate"
-priority = 70
-
-[[profiles.ha-auto.rules]]
-when     = { class = "conversation" }
-route_to = "local:moderate"
-priority = 60
-
-[[profiles.ha-auto.rules]]
-when     = { class = "inquiry" }
-route_to = "local:deep"
-priority = 50
-
-[[profiles.ha-auto.rules]]
-when     = { class = "other" }
-route_to = "local:deep"
-priority = 10
-
-# Per-class framing nudges — prepended to system_prompt before dispatch.
-# command/other intentionally omitted: system_prompt covers commands;
-# deep model handles "other" without extra framing.
-[profiles.ha-auto.class_prompts]
-greeting     = "Respond warmly. Keep it to one sentence."
-chitchat     = "Answer briefly from general knowledge."
-conversation = "The user is continuing a prior exchange."
-inquiry      = "Query the device state and answer in one sentence."
-
-system_prompt = """\
-You are a Home Assistant voice controller. Execute commands via tools; confirm briefly.
-
-- Match entity names exactly from the provided list. Pick the closest match for ambiguous requests.
-- Multiple matches (e.g. two office lights): call the tool once per entity.
-- "lock" / "lock up" = HassTurnOn(domain=lock). "unlock" = HassTurnOff(domain=lock).
-- Door names: "front door" may be a contact sensor (open/closed); "front door lock" is the lock entity. Use the lock entity for lock/unlock commands and lock status queries.
-- State queries: call the tool, answer in one sentence.
-- Automation toggle: use the tool, confirm. Creating automations needs the HA UI.
-- Off-topic questions: answer in one sentence from general knowledge.
-- No entity match: ask one short clarifying question.\
-"""
-
-# "ha-auto:fast:latest" — same classifier as ha-auto, capped at local:moderate.
-# max_auto_tier does the downscaling — classifier sees all 3 tiers, gateway clamps.
-#
-# Trade-off: ~2s warm responses at some accuracy cost vs ha-auto.
-[profiles."ha-auto:fast"]
-mode              = "classify"
-classifier        = "local:instant"
-max_auto_tier     = "local:moderate"
-classifier_prompt = """\
-Classify this Home Assistant voice command into exactly one tier.
-
-fast     — greeting, chitchat, joke, general knowledge, or simple command without a named entity
-moderate — single device command with a clearly named entity or area
-deep     — status query, multi-device command, scene, routine, or arrival/departure trigger
-
-  Hi                                                       -> fast
-  Hello                                                    -> fast
-  Hey                                                      -> fast
-  How are you                                              -> fast
-  Good morning                                             -> fast
-  Tell me a joke                                           -> fast
-  What's the capital of France?                            -> fast
-  What model are you?                                      -> fast
-  What time is it?                                         -> fast
-  Thank you                                                -> fast
-  Turn on the light                                        -> fast
-  Turn off the light                                       -> fast
-  Lock up                                                  -> fast
-  Never mind                                               -> fast
-  Turn on the office light                                 -> moderate
-  Turn off the kitchen light                               -> moderate
-  Lock the front door                                      -> moderate
-  Unlock the back door                                     -> moderate
-  Turn off the TV                                          -> moderate
-  Set the thermostat to 72                                 -> moderate
-  Dim the bedroom light to 50%                             -> moderate
-  Play music in the living room                            -> moderate
-  Open the garage door                                     -> moderate
-  Close the blinds in the bedroom                          -> moderate
-  Set the living room light to blue                        -> moderate
-  Is the front door locked?                                -> deep
-  Is the garage door open?                                 -> deep
-  What is the living room temperature?                     -> deep
-  Are any lights on downstairs?                            -> deep
-  What lights are still on?                                -> deep
-  Are all the doors locked?                                -> deep
-  Turn off all the lights                                  -> deep
-  Turn on everything in the kitchen                        -> deep
-  Goodnight                                                -> deep
-  I'm home                                                 -> deep
-  I'm leaving                                              -> deep
-
-Reply with one word: fast, moderate, or deep.\
-"""
-system_prompt = """\
-You are a Home Assistant voice controller. Execute commands via tools; confirm briefly.
-
-- Match entity names exactly from the provided list. Pick the closest match for ambiguous requests.
-- Multiple matches (e.g. two office lights): call the tool once per entity.
-- "lock" / "lock up" = HassTurnOn(domain=lock). "unlock" = HassTurnOff(domain=lock).
-- Door names: "front door" may be a contact sensor (open/closed); "front door lock" is the lock entity. Use the lock entity for lock/unlock commands and lock status queries.
-- State queries: call the tool, answer in one sentence.
-- Automation toggle: use the tool, confirm. Creating automations needs the HA UI.
-- Off-topic questions: answer in one sentence from general knowledge.
-- No entity match: ask one short clarifying question.\
-"""
-
-# "general:latest" — generic smart router for Open WebUI and other LAN clients.
-[profiles.general]
-mode              = "classify"
-classifier        = "local:instant"
-max_auto_tier     = "local:max"
-classifier_prompt = """\
-Classify this request. Reply with exactly one label.
-
-instant    — greeting, one-word fact, no reasoning needed          (1.7b)
-fast       — simple question with mild uncertainty                 (1.7b + CoT)
-moderate   — explanation, code, analysis, device commands          (7b)
-deep       — complex code, architecture, detailed analysis         (14b)
-max        — hardest problems, multi-step reasoning, design        (14b + CoT)
-
-Reply with one word only: instant, fast, moderate, deep, or max.\
-"""
-system_prompt = """\
-You are a concise and helpful AI assistant.
-- Answer directly without unnecessary preamble or apologies.
-- For code: add brief comments; use idiomatic style for the language.
-- For explanations: match depth to complexity — one sentence for facts, structured detail for concepts.
-- For design and architecture: give concrete recommendations with trade-offs.
-"""
-
-# "default" profile — fallback for unauthenticated /v1/chat/completions requests.
-[profiles.default]
-mode              = "classify"
-classifier        = "local:instant"
-max_auto_tier     = "local:max"
-classifier_prompt = """\
-Classify this request. Reply with exactly one label.
-
-instant    — greeting, one-word fact, no reasoning needed          (1.7b)
-fast       — simple question with mild uncertainty                 (1.7b + CoT)
-moderate   — explanation, code, analysis, device commands          (7b)
-deep       — complex code, architecture, detailed analysis         (14b)
-max        — hardest problems, multi-step reasoning, design        (14b + CoT)
-
-Reply with one word only: instant, fast, moderate, deep, or max.\
-"""

@@ -209,6 +209,14 @@ pub(super) fn classify_and_resolve<'a>(
                     candidates.iter().position(|t| t.name == rule_tier.name)
                 {
                     let estimated_tokens = super::estimate_request_tokens(body);
+                    let rule_cap = candidates[rule_idx].max_context_tokens;
+                    debug!(
+                        profile = %profile_name,
+                        estimated_tokens,
+                        tier = %rule_tier.name,
+                        tier_max_ctx = ?rule_cap,
+                        "context-window gating check (rule path)"
+                    );
                     let min_idx = super::find_min_tier_for_tokens(candidates, estimated_tokens, rule_idx);
                     if min_idx > rule_idx {
                         debug!(
@@ -255,6 +263,14 @@ pub(super) fn classify_and_resolve<'a>(
         // estimated token count, bump up to the next tier that can.
         let estimated_tokens = super::estimate_request_tokens(body);
         let target_idx = candidates.iter().position(|t| t.name == target_tier.name).unwrap_or(0);
+        let tier_cap = candidates[target_idx].max_context_tokens;
+        debug!(
+            profile = %profile_name,
+            estimated_tokens,
+            tier = %target_tier.name,
+            tier_max_ctx = ?tier_cap,
+            "context-window gating check"
+        );
         let min_idx = super::find_min_tier_for_tokens(candidates, estimated_tokens, target_idx);
         if min_idx > target_idx {
             debug!(
@@ -289,7 +305,7 @@ pub(super) fn classify_and_resolve<'a>(
 /// hint is unrecognised, the profile's fallback tier is used. If
 /// `profile.expert_requires_flag` is `true` and the resolved tier sits above
 /// `max_auto_tier` in the ladder, the request is rejected unless `expert_gate`
-/// is `true` (i.e. the client sent `X-Claw-Expert: true`).
+/// is `true` (i.e. the client sent `X-LMG-Expert: true`).
 ///
 /// Returns the resolved tier and the original model hint string (needed for
 /// traffic log annotations).
@@ -331,7 +347,7 @@ pub(super) fn resolve_target_tier<'a>(
             .unwrap_or(0);
         if tier_idx > max_idx {
             anyhow::bail!(
-                "tier `{}` requires the `X-Claw-Expert: true` header",
+                "tier `{}` requires the `X-LMG-Expert: true` header",
                 target_tier.name
             );
         }

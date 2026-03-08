@@ -111,11 +111,18 @@ pub async fn config(State(state): State<Arc<RouterState>>) -> impl IntoResponse 
         .tiers
         .iter()
         .map(|t| {
-            json!({
+            let mut tier = json!({
                 "name": t.name,
                 "backend": t.backend,
                 "model": t.model,
-            })
+            });
+            if let Some(think) = t.think {
+                tier["think"] = json!(think);
+            }
+            if let Some(max_ctx) = t.max_context_tokens {
+                tier["max_context_tokens"] = json!(max_ctx);
+            }
+            tier
         })
         .collect();
 
@@ -270,6 +277,7 @@ mod tests {
                 health_error_threshold: None,
                 public_profile: None,
                 request_timeout_ms: None,
+                profile_dir: None,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();

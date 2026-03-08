@@ -1,7 +1,5 @@
 //! Per-tier priority gate — "fire if top, queue if not".
 //!
-//! See `docs/gateway-priority-design.md` for the full specification.
-//!
 //! A request with priority `P` fires immediately if `P > max(in_flight)`.
 //! Otherwise it waits in a FIFO queue (within priority level) until an
 //! in-flight request completes and re-evaluation succeeds.

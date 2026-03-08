@@ -26,6 +26,26 @@
 #   backend = "ollama"
 #   model   = "qwen3:1.7b"
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# ─── profiles/ directory ─────────────────────────────────────────────────────
+# Place per-profile TOML files in a profiles/ directory next to config.toml.
+# Each *.toml file defines one profile; the filename becomes the profile name
+# (e.g. ha-auto.toml → "ha-auto"). Use a `name = "..."` field inside the file
+# to override the name when the real name contains characters invalid in
+# filenames (e.g. colons on Windows: ha-auto_fast.toml  with name="ha-auto:fast").
+#
+# Profile files are loaded after inline [profiles.*] and conf.d/ overlays,
+# so directory profiles take precedence on name collision.
+#
+# Override the directory path with gateway.profile_dir if needed:
+#   [gateway]
+#   profile_dir = "/etc/lm-gateway/profiles"
+#
+# Example profiles/default.toml:
+#   mode          = "classify"
+#   classifier    = "local:fast"
+#   max_auto_tier = "local:deep"
+# ─────────────────────────────────────────────────────────────────────────────
 
 [gateway]
 client_port = 8080       # agent-facing client API
@@ -146,7 +166,7 @@ model   = "anthropic/claude-opus-4-5"
 mode               = "dispatch"       # "dispatch" | "escalate" | "classify"
 classifier         = "local:fast"     # tier used for intent classification (dispatch mode)
 max_auto_tier      = "cloud:fast"     # ceiling before expert_requires_flag kicks in
-expert_requires_flag = true           # client must set X-Claw-Expert: true to reach expert tier
+expert_requires_flag = true           # client must set X-LMG-Expert: true to reach expert tier
 # rate_limit_rpm = 120               # total RPM shared by ALL clients on this profile
 
 # Escalate profile — tries cheap first, steps up if response is insufficient
