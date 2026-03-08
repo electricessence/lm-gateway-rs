@@ -727,6 +727,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_bumps_tier_when_context_window_exceeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(long_response(
+                "Response from the bumped tier after context-window gating kicked in.",
+            )))
+            .mount(&server)
+            .await;
+
+        // Build a config where the first tier has a tiny max_context_tokens
+        let config = crate::config::Config {
+            gateway: GatewayConfig {
+                client_port: 8080,
+                admin_port: 8081,
+                traffic_log_capacity: 100,
+                log_level: None,
+                rate_limit_rpm: None,
+                admin_token_env: None,
+                max_retries: None,
+                retry_delay_ms: None,
+                health_window: None,
+                health_error_threshold: None,
+                public_profile: None,
+                request_timeout_ms: None,
+            },
+            backends: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "mock".into(),
+                    BackendConfig {
+                        base_url: server.uri(),
+                        api_key_env: None,
+                        api_key_secret: None,
+                        timeout_ms: 5_000,
+                        provider: crate::config::Provider::default(),
+                        default_options: None,
+                    },
+                );
+                m
+            },
+            tiers: vec![
+                TierConfig {
+                    name: "tiny".into(),
+                    backend: "mock".into(),
+                    model: "tiny-model".into(),
+                    think: None,
+                    max_context_tokens: Some(10), // Very small — will overflow
+                },
+                TierConfig {
+                    name: "big".into(),
+                    backend: "mock".into(),
+                    model: "big-model".into(),
+                    think: None,
+                    max_context_tokens: None, // No limit
+                },
+            ],
+            aliases: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("hint:fast".into(), "tiny".into());
+                m
+            },
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    ProfileConfig {
+                        mode: RoutingMode::Dispatch,
+                        classifier: "tiny".into(),
+                        max_auto_tier: "big".into(),
+                        expert_requires_flag: false,
+                        rate_limit_rpm: None,
+                        classifier_prompt: None,
+                        classifier_think: None,
+                        system_prompt: None,
+                        rules: vec![],
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            clients: vec![],
+        };
+        let state = RouterState::new(
+            Arc::new(config),
+            std::path::PathBuf::default(),
+            Arc::new(TrafficLog::new(100)),
+        );
+
+        // Send a request that resolves to "tiny" but whose tokens exceed 10
+        let body = json!({
+            "model": "hint:fast",
+            "messages": [{"role": "user", "content": "This message is long enough to exceed the tiny tier context window limit easily."}]
+        });
+
+        let (_, entry) = route(&state, body, None, None, 0, false, false).await.unwrap();
+        // Should have been bumped from "tiny" to "big"
+        assert_eq!(entry.tier, "big", "expected context-window gating to bump from tiny to big");
+    }
+
+    #[tokio::test]
     async fn dispatch_resolves_direct_tier_name_without_alias() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
