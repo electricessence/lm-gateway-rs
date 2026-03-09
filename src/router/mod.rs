@@ -33,6 +33,8 @@ use bytes::Bytes;
 use serde_json::Value;
 use tracing::debug;
 
+use futures_util::StreamExt;
+
 use crate::{
     api::rate_limit::RateLimiter,
     backends::{BackendClient, SseStream},
@@ -548,12 +550,61 @@ pub async fn route_stream(
 
     state.traffic.push(entry.clone());
 
+    // Experimental: thinking message — inject a synthetic prefix chunk for perceived
+    // responsiveness.  Works for streaming chat UIs; HA voice buffers the full response
+    // so the prefix gets concatenated into the spoken answer instead of rendering early.
+    let stream_response = if let Some(pool) = profile.thinking_messages.get(&target_tier_name) {
+        if let Some(msg) = pick_thinking_message(pool) {
+            let prefix = if is_native_ndjson {
+                let chunk = serde_json::json!({
+                    "model": target_tier.model,
+                    "message": { "role": "assistant", "content": format!("{msg} ") },
+                    "done": false
+                });
+                Bytes::from(format!("{chunk}\n"))
+            } else {
+                let chunk = serde_json::json!({
+                    "id": "thinking",
+                    "object": "chat.completion.chunk",
+                    "model": target_tier.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "role": "assistant", "content": format!("{msg} ") },
+                        "finish_reason": null
+                    }]
+                });
+                Bytes::from(format!("data: {chunk}\n\n"))
+            };
+            let prefix_stream = futures_util::stream::once(async move { Ok(prefix) });
+            Box::pin(prefix_stream.chain(stream_response)) as SseStream
+        } else {
+            stream_response
+        }
+    } else {
+        stream_response
+    };
+
     Ok((stream_response, entry, is_native_ndjson))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Pick a pseudo-random thinking message from the pool.
+///
+/// Uses nanosecond timestamp instead of a full RNG crate — good enough for
+/// UI variety, not for cryptography.
+fn pick_thinking_message(pool: &[String]) -> Option<&str> {
+    if pool.is_empty() {
+        return None;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize;
+    Some(&pool[nanos % pool.len()])
+}
 
 /// Default message returned by reply-mode profiles when no custom message is set.
 const DEFAULT_REPLY_MESSAGE: &str =

@@ -169,6 +169,26 @@ pub struct ProfileConfig {
     /// Defaults to a generic "not configured" message when absent.
     #[serde(default)]
     pub reply_message: Option<String>,
+
+    /// **Experimental.** Per-tier thinking message pools, keyed by tier name.
+    ///
+    /// When a streaming request routes to a tier listed here, one message is
+    /// randomly selected and injected as a synthetic chunk before the
+    /// backend's first real token. Intended for streaming chat UIs where
+    /// early tokens improve perceived responsiveness. Has no effect on
+    /// consumers that buffer the full response before rendering (e.g. HA voice).
+    ///
+    /// Only applies to streaming requests. Non-streaming requests are unaffected.
+    ///
+    /// ```toml
+    /// [profiles.ha-auto.thinking_messages]
+    /// "local:deep" = [
+    ///     "Let me think about that.",
+    ///     "Give me a moment.",
+    /// ]
+    /// ```
+    #[serde(default)]
+    pub thinking_messages: HashMap<String, Vec<String>>,
 }
 
 /// Default classification prompt injected as the system message for `classify` mode.

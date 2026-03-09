@@ -556,6 +556,77 @@ without manual prompt engineering.
 
 ---
 
+### Sensitive value tokenization — privacy shim for cloud routing
+
+When a request is routed to a cloud provider (Anthropic, OpenRouter, etc.), the prompt may contain
+sensitive values — API keys, tokens, names, addresses, internal hostnames — that the operator does
+not want leaving the private network in plaintext.
+
+**How it works:**
+
+Before dispatching to a cloud backend, the gateway scans the outgoing prompt for values matching
+configured patterns and replaces each match with a stable, opaque placeholder token. The real
+values are held in a per-request token map. After the cloud response arrives, the gateway
+rehydrates the response — substituting each placeholder back with its original value — before
+returning anything to the caller.
+
+```
+                ┌─────────┐      tokenized prompt     ┌──────────────┐
+  caller ───►  │ gateway │ ─────────────────────────► │ cloud model  │
+               │         │ ◄───── tokenized response ─ │              │
+  caller ◄───  │         │   (rehydrated in-flight)    └──────────────┘
+               └─────────┘
+```
+
+**Config sketch:**
+
+```toml
+[tokenization]
+enabled_for_backends = ["anthropic", "openrouter"]  # only cloud backends need this
+
+[[tokenization.patterns]]
+label   = "bearer_token"
+pattern = "Bearer [A-Za-z0-9\\-._~+/]+"    # regex match
+token   = "{{TOKEN_BEARER}}"               # stable placeholder (deterministic)
+
+[[tokenization.patterns]]
+label   = "api_key"
+pattern = "sk-[A-Za-z0-9]+"
+token   = "{{TOKEN_API_KEY}}"
+
+[[tokenization.patterns]]
+label   = "ip_address"
+pattern = "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b"
+token   = "{{TOKEN_IP}}"
+```
+
+Multiple distinct values matching the same pattern get sequentially numbered tokens
+(`{{TOKEN_IP_1}}`, `{{TOKEN_IP_2}}`) so they round-trip correctly even when the model
+references both in its response.
+
+**Design principles:**
+
+- Tokenization is applied to the *outbound prompt text only* — not to headers, model names, or
+  gateway-internal metadata
+- Rehydration scans the *full response body*, including streaming chunks, and substitutes
+  tokens back before forwarding bytes to the caller
+- The token map is per-request and in-memory only — never logged, never persisted
+- Patterns are user-defined regex — the gateway doesn't presume what counts as sensitive
+- Local backends are never tokenized — only backends where `enabled_for_backends` matches
+- If rehydration finds a token in the response that has no mapping (model invented it),
+  it is left as-is and a warning is emitted to the trace log
+
+**What changes in code (~150 lines new Rust):**
+
+- `config/mod.rs`: add `TokenizationConfig { enabled_for_backends: Vec<String>, patterns: Vec<PatternConfig> }`
+- New module `tokenizer.rs`: `tokenize(text, patterns) -> (String, TokenMap)` and
+  `rehydrate(text, map) -> String`; handles `_1` / `_2` suffixes for collisions
+- `backends/mod.rs`: wrap outbound request body through `tokenize()` when the backend name
+  matches `enabled_for_backends`; wrap response body (or stream) through `rehydrate()` before
+  returning
+
+---
+
 ## Vision
 
 lm-gateway-rs is built on a simple principle: **the deployment model should never become the problem.** One binary. One config file. Zero external state. Runs anywhere.
