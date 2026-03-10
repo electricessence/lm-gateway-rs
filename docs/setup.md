@@ -4,6 +4,19 @@ This guide covers first-time setup and ongoing key rotation for `lm-gateway-rs`.
 
 ---
 
+## Clone Setup
+
+After cloning, activate the repo's pre-commit hook (guards against committing
+private hostnames, IPs, and credentials):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This is a one-time step per clone. The hook runs automatically on every `git commit`.
+
+---
+
 ## Prerequisites
 
 - A Linux server with Docker and Docker Compose installed

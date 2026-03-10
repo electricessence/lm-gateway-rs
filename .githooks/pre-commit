@@ -1,0 +1,82 @@
+#!/bin/sh
+# .githooks/pre-commit — guards against committing private deployment context.
+#
+# Activate once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass (use only when you're certain the match is safe):
+#   git commit --no-verify
+
+FAIL=0
+
+# All staged new/modified files (excluding the hook scripts themselves)
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^\.githooks/')
+
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+# Helper: get the added lines from staged diff for a set of files
+added_lines() {
+    git diff --cached -- "$@" \
+        | grep '^+' \
+        | grep -v '^+++'
+}
+
+# --- Check 1: .lan / .local hostnames ---
+# These indicate mDNS/private network hostnames (e.g. myserver.lan, host.local).
+LAN_HITS=$(added_lines $STAGED | grep -Ei '[a-z0-9-]+\.(lan|local)\b' || true)
+if [ -n "$LAN_HITS" ]; then
+    printf '\npre-commit: BLOCKED — .lan/.local hostname detected in staged changes:\n'
+    printf '%s\n' "$LAN_HITS"
+    FAIL=1
+fi
+
+# --- Check 2: Private IP addresses (non-example files only) ---
+# config.example.toml and docs/ are allowed to have example IPs.
+NON_EXAMPLE=$(printf '%s\n' $STAGED \
+    | grep -v '^config\.example\.toml$' \
+    | grep -v '^docs/' \
+    || true)
+if [ -n "$NON_EXAMPLE" ]; then
+    IP_HITS=$(added_lines $NON_EXAMPLE \
+        | grep -E '(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3})' \
+        || true)
+    if [ -n "$IP_HITS" ]; then
+        printf '\npre-commit: BLOCKED — private IP address in non-example staged file:\n'
+        printf '%s\n' "$IP_HITS"
+        FAIL=1
+    fi
+fi
+
+# --- Check 3: SSH key file paths ---
+# Catches paths like ~/.ssh/id_ed25519, /home/user/.ssh/id_rsa
+SSH_HITS=$(added_lines $STAGED \
+    | grep -E '\.ssh/[a-z0-9_.-]+' \
+    || true)
+if [ -n "$SSH_HITS" ]; then
+    printf '\npre-commit: BLOCKED — SSH key path in staged changes:\n'
+    printf '%s\n' "$SSH_HITS"
+    FAIL=1
+fi
+
+# --- Check 4: Embedded secret values (not env var names) ---
+# Catches api_key = "sk-..." or key = "abc123..." (actual values, not references)
+# Excludes api_key_env = "..." which is safe (env var name, not the value).
+SECRET_HITS=$(added_lines $STAGED \
+    | grep -Ev 'api_key_env\s*=' \
+    | grep -E '(api_key|password|secret|token)\s*=\s*"[a-zA-Z0-9+/]{16,}"' \
+    || true)
+if [ -n "$SECRET_HITS" ]; then
+    printf '\npre-commit: BLOCKED — embedded credential value in staged changes:\n'
+    printf '%s\n' "$SECRET_HITS"
+    FAIL=1
+fi
+
+if [ "$FAIL" -eq 1 ]; then
+    printf '\nCommit blocked. Remove or move the above to a gitignored file.\n'
+    printf 'To bypass intentionally: git commit --no-verify\n'
+    exit 1
+fi
+
+exit 0

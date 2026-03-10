@@ -11,6 +11,7 @@ tools/temp/
 
 # Live operational config — machine-specific, not committed
 etc/lm-gateway/config.toml
+etc/lm-gateway/env
 
 # One-off test artifacts
 ct.json
