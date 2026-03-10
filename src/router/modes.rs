@@ -96,8 +96,16 @@ pub(super) fn classify_and_resolve<'a>(
                 return None;
             }
 
+            // Require at least one user message — assistant-only context isn't
+            // meaningful for classification.
+            if !relevant.iter().any(|(role, _)| *role == "user") {
+                return None;
+            }
+
             // Apply classifier_context limit (take last N messages).
+            // `Some(0)` means "no context" — skip classification entirely.
             let window: &[(&str, &str)] = match profile.classifier_context {
+                Some(0) => return None,
                 Some(n) if n < relevant.len() => &relevant[relevant.len() - n..],
                 _ => &relevant,
             };
@@ -108,7 +116,8 @@ pub(super) fn classify_and_resolve<'a>(
             }
 
             // Multi-message: format as a labelled conversation block.
-            let mut buf = format!("[{message_count} messages in conversation]\n");
+            // Use window.len() so the count reflects filtered messages actually sent.
+            let mut buf = format!("[{} messages in conversation]\n", window.len());
             for (role, content) in window {
                 let label = if *role == "user" { "User" } else { "Assistant" };
                 buf.push_str(label);

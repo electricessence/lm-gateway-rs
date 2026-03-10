@@ -270,12 +270,14 @@ When omitted (the default), all user and assistant messages are included. For si
 For multi-message conversations, the classifier input is formatted as:
 
 ```
-[12 messages in conversation]
+[4 messages in conversation]
 User: Earlier question...
 Assistant: Earlier response...
 User: Follow-up question...
 Assistant: Follow-up response...
 ```
+
+The count reflects the number of user+assistant messages actually included (after applying `classifier_context` and stripping system/tool messages), not the raw request message count.
 
 ---
 
