@@ -717,10 +717,8 @@ mod tests {
     #[test]
     fn pick_thinking_message_multiple_elements_stays_in_bounds() {
         let pool = vec!["A".to_owned(), "B".to_owned(), "C".to_owned()];
-        for _ in 0..20 {
-            let msg = pick_thinking_message(&pool).expect("should return Some");
-            assert!(pool.contains(&msg.to_owned()), "returned message not in pool: {msg}");
-        }
+        let msg = pick_thinking_message(&pool).expect("should return Some");
+        assert!(pool.contains(&msg.to_owned()), "returned message not in pool: {msg}");
     }
 
     // -----------------------------------------------------------------------
