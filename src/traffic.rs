@@ -186,7 +186,11 @@ pub struct TrafficEntry {
     ///
     /// Only populated when the `debug-traffic` Cargo feature is compiled in
     /// **and** `traffic_log_debug = true` in the `[gateway]` config.
-    /// Contains messages, tools, and system prompt as dispatched to the backend.
+    ///
+    /// For routed requests this is the body (messages, tools, system prompt, etc.)
+    /// as dispatched to the backend. For reply-mode / synthetic responses it is
+    /// the inbound request body used to construct the synthetic reply — no backend
+    /// dispatch occurs in that case.
     ///
     /// Stored behind `Arc` so that cloning a [`TrafficEntry`] (e.g. when pushing
     /// to the ring buffer) shares the allocation rather than duplicating the body.
