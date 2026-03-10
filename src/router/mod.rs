@@ -209,6 +209,10 @@ pub struct RouterState {
 
     /// When `true`, attach full request bodies to traffic log entries.
     /// Requires the `debug-traffic` Cargo feature.
+    ///
+    /// Read once from config at startup in [`RouterState::new`] and cached here.
+    /// **Not updated on hot-reload** — restart the process to pick up a change
+    /// to `traffic_log_debug` in the gateway config.
     #[cfg(feature = "debug-traffic")]
     pub debug_traffic: bool,
 }
@@ -260,6 +264,13 @@ impl RouterState {
         tracing::debug!(count = gates.len(), "priority gates initialised");
         #[cfg(feature = "debug-traffic")]
         let debug_traffic = config.gateway.traffic_log_debug;
+        #[cfg(feature = "debug-traffic")]
+        if debug_traffic && admin_token.is_none() {
+            tracing::warn!(
+                "debug_traffic is enabled but no admin_token is configured — \
+                 request bodies are accessible unauthenticated via /admin/traffic"
+            );
+        }
         Self {
             config_lock: Arc::new(RwLock::new(config)),
             config_path,
@@ -331,7 +342,7 @@ pub async fn route(
             .unwrap_or("unknown")
             .to_owned();
         let msg = profile.reply_message.as_deref().unwrap_or(DEFAULT_REPLY_MESSAGE);
-        let mut entry = TrafficEntry::new("reply".into(), "none".into(), 0, false)
+        let mut entry = TrafficEntry::new("reply".into(), "none".into(), 0, true)
             .with_profile(profile_name)
             .with_requested_model(&model_hint)
             .with_routing_mode("reply");
@@ -341,7 +352,7 @@ pub async fn route(
         entry = entry.with_priority(priority);
         #[cfg(feature = "debug-traffic")]
         if state.debug_traffic {
-            entry = entry.with_debug_messages(request_body);
+            entry = entry.with_debug_messages(&request_body);
         }
         state.traffic.push(entry.clone());
         return Ok((build_reply_response(msg), entry));
@@ -405,7 +416,7 @@ pub async fn route(
     entry = entry.with_priority(priority);
     #[cfg(feature = "debug-traffic")]
     if state.debug_traffic {
-        entry = entry.with_debug_messages(request_body);
+        entry = entry.with_debug_messages(&request_body);
     }
 
     state.traffic.push(entry.clone());
@@ -455,7 +466,7 @@ pub async fn route_stream(
         entry = entry.with_priority(priority);
         #[cfg(feature = "debug-traffic")]
         if state.debug_traffic {
-            entry = entry.with_debug_messages(request_body);
+            entry = entry.with_debug_messages(&request_body);
         }
         state.traffic.push(entry.clone());
         return Ok((stream, entry, false));
@@ -590,7 +601,7 @@ pub async fn route_stream(
     }
     entry = entry.with_priority(priority);
     #[cfg(feature = "debug-traffic")]
-    if let Some(body) = debug_body {
+    if let Some(body) = &debug_body {
         entry = entry.with_debug_messages(body);
     }
 
@@ -856,6 +867,7 @@ mod tests {
                 public_profile: None,
                 request_timeout_ms: None,
                 profile_dir: None,
+                traffic_log_debug: false,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -974,6 +986,7 @@ mod tests {
                 public_profile: None,
                 request_timeout_ms: None,
                 profile_dir: None,
+                traffic_log_debug: false,
             },
             backends: {
                 let mut m = std::collections::HashMap::new();
@@ -1127,6 +1140,7 @@ mod tests {
                     public_profile: None,
                     request_timeout_ms: None,
                     profile_dir: None,
+                    traffic_log_debug: false,
                 },
                 backends: std::collections::HashMap::new(),
                 tiers: vec![],
@@ -1515,5 +1529,136 @@ mod tests {
         ];
         // start_idx=1 means we skip "small" entirely
         assert_eq!(find_min_tier_for_tokens(&tiers, 100, 1), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // debug-traffic capture — only compiled with the feature flag
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "debug-traffic")]
+    #[tokio::test]
+    async fn debug_traffic_captures_request_body_in_entry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(long_response(
+                "Debug body capture response.",
+            )))
+            .mount(&server)
+            .await;
+
+        let config = crate::config::Config {
+            gateway: GatewayConfig {
+                client_port: 8080,
+                admin_port: 8081,
+                traffic_log_capacity: 100,
+                log_level: None,
+                rate_limit_rpm: None,
+                admin_token_env: None,
+                max_retries: None,
+                retry_delay_ms: None,
+                health_window: None,
+                health_error_threshold: None,
+                public_profile: None,
+                request_timeout_ms: None,
+                profile_dir: None,
+                traffic_log_debug: true,
+            },
+            backends: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "mock".into(),
+                    BackendConfig {
+                        base_url: server.uri(),
+                        api_key_env: None,
+                        api_key_secret: None,
+                        timeout_ms: 5_000,
+                        provider: crate::config::Provider::default(),
+                        default_options: None,
+                    },
+                );
+                m
+            },
+            tiers: vec![TierConfig {
+                name: "local:fast".into(),
+                backend: "mock".into(),
+                model: "fast-model".into(),
+                think: None,
+                max_context_tokens: None,
+            }],
+            aliases: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("hint:fast".into(), "local:fast".into());
+                m
+            },
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    ProfileConfig {
+                        mode: RoutingMode::Dispatch,
+                        classifier: "local:fast".into(),
+                        max_auto_tier: "local:fast".into(),
+                        expert_requires_flag: false,
+                        rate_limit_rpm: None,
+                        classifier_prompt: None,
+                        classifier_think: None,
+                        system_prompt: None,
+                        rules: vec![],
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            clients: vec![],
+        };
+        let state = RouterState::new(
+            Arc::new(config),
+            std::path::PathBuf::default(),
+            Arc::new(TrafficLog::new(100)),
+        );
+
+        let body = json!({
+            "model": "hint:fast",
+            "messages": [{"role": "user", "content": "capture this body"}]
+        });
+        let (_, entry) = route(&state, body.clone(), None, None, 0, false, false)
+            .await
+            .unwrap();
+
+        assert!(
+            entry.debug_request_body.is_some(),
+            "debug_request_body must be populated when debug_traffic = true"
+        );
+        // The captured body must contain the original model hint
+        assert_eq!(
+            entry.debug_request_body.as_ref().and_then(|b| b["model"].as_str()),
+            Some("hint:fast")
+        );
+    }
+
+    #[cfg(feature = "debug-traffic")]
+    #[tokio::test]
+    async fn debug_traffic_omits_body_when_disabled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(long_response(
+                "No debug body expected here.",
+            )))
+            .mount(&server)
+            .await;
+
+        // mock_state uses traffic_log_debug: false
+        let state = mock_state(&server, RoutingMode::Dispatch).await;
+        let body = json!({
+            "model": "hint:fast",
+            "messages": [{"role": "user", "content": "do not capture"}]
+        });
+        let (_, entry) = route(&state, body, None, None, 0, false, false).await.unwrap();
+        assert!(
+            entry.debug_request_body.is_none(),
+            "debug_request_body must be None when debug_traffic = false"
+        );
     }
 }

@@ -187,7 +187,7 @@ pub struct TrafficEntry {
     /// Contains messages, tools, and system prompt as dispatched to the backend.
     #[cfg(feature = "debug-traffic")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub debug_messages: Option<Value>,
+    pub debug_request_body: Option<Value>,
 }
 
 impl TrafficEntry {
@@ -208,7 +208,7 @@ impl TrafficEntry {
             profile_chain: None,
             priority: 0,
             #[cfg(feature = "debug-traffic")]
-            debug_messages: None,
+            debug_request_body: None,
         }
     }
 
@@ -262,8 +262,8 @@ impl TrafficEntry {
     ///
     /// Only available when compiled with `--features debug-traffic`.
     #[cfg(feature = "debug-traffic")]
-    pub fn with_debug_messages(mut self, body: Value) -> Self {
-        self.debug_messages = Some(body);
+    pub fn with_debug_messages(mut self, body: &Value) -> Self {
+        self.debug_request_body = Some(body.clone());
         self
     }
 
@@ -446,5 +446,41 @@ mod tests {
         let err = TrafficEntry::new("t".into(), "b".into(), 0, false);
         assert!(ok.success);
         assert!(!err.success);
+    }
+
+    // -----------------------------------------------------------------------
+    // debug-traffic builder
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "debug-traffic")]
+    #[test]
+    fn with_debug_messages_populates_debug_request_body() {
+        use serde_json::json;
+        let body = json!({
+            "model": "hint:fast",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let entry = TrafficEntry::new("local:fast".into(), "mock".into(), 10, true)
+            .with_debug_messages(&body);
+        assert_eq!(
+            entry.debug_request_body.as_ref(),
+            Some(&body),
+            "debug_request_body must equal the body passed to with_debug_messages"
+        );
+    }
+
+    #[cfg(feature = "debug-traffic")]
+    #[test]
+    fn with_debug_messages_clones_independently() {
+        use serde_json::json;
+        let mut body = json!({"model": "hint:fast", "messages": []});
+        let entry = TrafficEntry::new("local:fast".into(), "mock".into(), 10, true)
+            .with_debug_messages(&body);
+        // Mutate the original — the captured copy must be unaffected.
+        body["model"] = json!("mutated");
+        assert_eq!(
+            entry.debug_request_body.as_ref().and_then(|b| b["model"].as_str()),
+            Some("hint:fast")
+        );
     }
 }

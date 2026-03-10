@@ -108,7 +108,10 @@ pub struct GatewayConfig {
     ///
     /// **Security warning:** request bodies may contain sensitive content.
     /// Enable only for local debugging; disable in production.
-    #[cfg(feature = "debug-traffic")]
+    ///
+    /// The field is always present in config (so it can be set without the
+    /// feature flag causing a parse error); capture behaviour is only active
+    /// when the binary is compiled with `--features debug-traffic`.
     #[serde(default)]
     pub traffic_log_debug: bool,
 
