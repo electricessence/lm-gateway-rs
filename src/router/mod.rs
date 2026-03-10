@@ -49,6 +49,37 @@ pub mod priority;
 use priority::TierPriorityGate;
 
 // ---------------------------------------------------------------------------
+// Text extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the text content from a single chat message `content` field.
+///
+/// Handles both plain string content and OpenAI-style multimodal array-of-parts
+/// (`[{type:"text", text:"..."}, ...]`). Non-text parts (images, audio) are
+/// skipped; multi-part arrays are joined with a single space. Returns `None`
+/// when the field is absent or yields no text.
+pub(crate) fn extract_message_text(msg: &Value) -> Option<String> {
+    match msg.get("content")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let text: String = parts
+                .iter()
+                .filter_map(|p| {
+                    if p.get("type").and_then(Value::as_str) == Some("text") {
+                        p.get("text").and_then(Value::as_str).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token estimation
 // ---------------------------------------------------------------------------
 
@@ -74,23 +105,9 @@ pub(crate) fn estimate_request_tokens(body: &Value) -> u32 {
         for msg in msgs {
             // Per-message overhead (role, separators) — OpenAI uses ~4 tokens per message
             token_count += 4;
-            // Handle both string and array-of-parts content (for multimodal requests).
-            if let Some(content_val) = msg.get("content") {
-                match content_val {
-                    Value::String(text) => {
-                        token_count += bpe.encode_ordinary(text).len();
-                    }
-                    Value::Array(parts) => {
-                        for part in parts {
-                            if let Some("text") = part.get("type").and_then(Value::as_str) {
-                                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                    token_count += bpe.encode_ordinary(text).len();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            // Handles both string and array-of-parts content (for multimodal requests).
+            if let Some(text) = extract_message_text(msg) {
+                token_count += bpe.encode_ordinary(&text).len();
             }
             if let Some(role) = msg.get("role").and_then(Value::as_str) {
                 token_count += bpe.encode_ordinary(role).len();

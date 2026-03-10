@@ -20,6 +20,84 @@ use super::{
     classify::{parse_classification, ParsedClassification, resolve_tier_by_label},
 };
 
+/// Build the classifier input string from a profile and message array.
+///
+/// Returns `None` when classification should be skipped entirely:
+/// - `classifier_context = 0` — profile explicitly disables classification;
+///   the caller routes starting at the classifier tier with context-window gating.
+/// - No user or assistant messages are present.
+/// - The filtered window contains only assistant messages (no user turn to classify).
+pub(super) fn build_classifier_input(profile: &ProfileConfig, messages: &[Value]) -> Option<String> {
+    // `Some(0)` disables the pre-flight classifier context: skip building a
+    // history window and let the caller route starting at the classifier tier,
+    // still applying context-window gating across candidate tiers.
+    if profile.classifier_context == Some(0) {
+        return None;
+    }
+
+    // Build the window: filter user/assistant text messages, optionally capped
+    // to the last N. Walk from the end when bounded to avoid scanning the full
+    // history for small contexts (e.g. 1–4 messages).
+    let window: Vec<(&str, String)> = match profile.classifier_context {
+        Some(n) => {
+            let n = n as usize;
+            let mut w: Vec<(&str, String)> = messages
+                .iter()
+                .rev()
+                .filter_map(|m| {
+                    let role = m.get("role").and_then(Value::as_str)?;
+                    if role != "user" && role != "assistant" {
+                        return None;
+                    }
+                    let content = super::extract_message_text(m)?;
+                    Some((role, content))
+                })
+                .take(n)
+                .collect();
+            w.reverse();
+            w
+        }
+        None => messages
+            .iter()
+            .filter_map(|m| {
+                let role = m.get("role").and_then(Value::as_str)?;
+                if role != "user" && role != "assistant" {
+                    return None;
+                }
+                let content = super::extract_message_text(m)?;
+                Some((role, content))
+            })
+            .collect(),
+    };
+
+    if window.is_empty() {
+        return None;
+    }
+
+    // Require at least one user message — assistant-only context isn't
+    // meaningful for classification.
+    if !window.iter().any(|(role, _)| *role == "user") {
+        return None;
+    }
+
+    // Single message (common case): return it as-is without header formatting.
+    if window.len() == 1 {
+        return Some(window.into_iter().next().unwrap().1);
+    }
+
+    // Multi-message: format as a labelled conversation block.
+    // Use window.len() so the count reflects filtered messages actually sent.
+    let mut buf = format!("[{} messages in conversation]\n", window.len());
+    for (role, content) in &window {
+        let label = if *role == "user" { "User" } else { "Assistant" };
+        buf.push_str(label);
+        buf.push_str(": ");
+        buf.push_str(content);
+        buf.push('\n');
+    }
+    Some(buf)
+}
+
 /// Outcome of a classify-mode routing pass.
 ///
 /// Carries the resolved tier name, optional `think` override to inject before
@@ -86,101 +164,7 @@ pub(super) fn classify_and_resolve<'a>(
             .unwrap_or(config.tiers.len().saturating_sub(1));
         let candidates: &[TierConfig] = &config.tiers[..=max_idx];
 
-        let classifier_input = messages.and_then(|arr| {
-            // `Some(0)` disables the pre-flight classifier context: don't build
-            // a history window here and let routing fall back to the classifier
-            // tier directly.
-            if profile.classifier_context == Some(0) {
-                return None;
-            }
-
-            // Extract the text from a message's `content` field.
-            // Handles both plain string content and OpenAI-style multimodal
-            // array-of-parts (e.g. `[{type:"text", text:"..."}, ...]`).
-            // Non-text parts (images, audio) are skipped.
-            let extract_text = |m: &Value| -> Option<String> {
-                match m.get("content")? {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Array(parts) => {
-                        let text: String = parts
-                            .iter()
-                            .filter_map(|p| {
-                                if p.get("type").and_then(Value::as_str) == Some("text") {
-                                    p.get("text").and_then(Value::as_str).map(str::to_owned)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if text.is_empty() { None } else { Some(text) }
-                    }
-                    _ => None,
-                }
-            };
-
-            // Build the window: filter user/assistant text messages, optionally
-            // capped to the last N. Walk from the end when bounded to avoid
-            // scanning the full history for small contexts (e.g. 1–4 messages).
-            let window: Vec<(&str, String)> = match profile.classifier_context {
-                Some(n) => {
-                    let n = n as usize;
-                    let mut w: Vec<(&str, String)> = arr
-                        .iter()
-                        .rev()
-                        .filter_map(|m| {
-                            let role = m.get("role").and_then(Value::as_str)?;
-                            if role != "user" && role != "assistant" {
-                                return None;
-                            }
-                            let content = extract_text(m)?;
-                            Some((role, content))
-                        })
-                        .take(n)
-                        .collect();
-                    w.reverse();
-                    w
-                }
-                None => arr
-                    .iter()
-                    .filter_map(|m| {
-                        let role = m.get("role").and_then(Value::as_str)?;
-                        if role != "user" && role != "assistant" {
-                            return None;
-                        }
-                        let content = extract_text(m)?;
-                        Some((role, content))
-                    })
-                    .collect(),
-            };
-
-            if window.is_empty() {
-                return None;
-            }
-
-            // Require at least one user message — assistant-only context isn't
-            // meaningful for classification.
-            if !window.iter().any(|(role, _)| *role == "user") {
-                return None;
-            }
-
-            // Single message (common case): return it as-is.
-            if window.len() == 1 {
-                return Some(window.into_iter().next().unwrap().1);
-            }
-
-            // Multi-message: format as a labelled conversation block.
-            // Use window.len() so the count reflects filtered messages actually sent.
-            let mut buf = format!("[{} messages in conversation]\n", window.len());
-            for (role, content) in &window {
-                let label = if *role == "user" { "User" } else { "Assistant" };
-                buf.push_str(label);
-                buf.push_str(": ");
-                buf.push_str(content);
-                buf.push('\n');
-            }
-            Some(buf)
-        });
+        let classifier_input = messages.and_then(|arr| build_classifier_input(profile, arr));
 
         let Some(classifier_input) = classifier_input else {
             // Apply context-window gating even on the bypass path so oversized

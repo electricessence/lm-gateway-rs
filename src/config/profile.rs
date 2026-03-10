@@ -171,8 +171,10 @@ pub struct ProfileConfig {
     /// positive integer to cap how far back the classifier looks — e.g. `4` sends
     /// only the last 4 user/assistant messages.
     ///
-    /// Setting `0` disables classification entirely for the profile (the request
-    /// is forwarded to the classifier tier without classification).
+    /// Setting `0` disables classification entirely for the profile: the router
+    /// skips the classifier step and routes starting at the classifier tier,
+    /// still applying context-window gating (which may bump the request to a
+    /// higher tier if the classifier tier cannot fit the request).
     ///
     /// Useful for profiles where classification speed matters more than deep
     /// context awareness (e.g. Home Assistant voice, where each utterance is
