@@ -195,7 +195,9 @@ classifier         = "local:fast"   # tier used for the pre-flight classificatio
 max_auto_tier      = "cloud:expert" # ceiling tier; exclude cloud:expert to cap at cloud:deep
 # classifier_prompt = "..."         # override the built-in classification prompt (v16, 27/27 on 27-case HA benchmark)
 # classifier_context = 4            # limit classifier input to last N user+assistant messages (default: full history).
-#                                   # Earlier versions only sent the last user message; set this to 1 to approximate that behaviour.
+#                                   # Earlier versions only sent the last user message; set this to 1 to roughly approximate
+#                                   # that behaviour — note: classification is skipped entirely if the most recent message
+#                                   # is assistant-only, as the router requires at least one user message in the window.
 # system_prompt     = "..."         # prepended to every request forwarded through this profile
 #
 # Semantic tag rules (classify mode only).

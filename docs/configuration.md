@@ -270,7 +270,7 @@ Special values:
 | Value | Behaviour |
 |---|---|
 | Absent (default) | Full user+assistant history |
-| `1` | Only the most recent user or assistant message (approximates pre-`classifier_context` behaviour) |
+| `1` | Only the most recent **user** message; if the last window entry is assistant-only, classification is skipped entirely. No `[N messages in conversation]` header — approximates pre-`classifier_context` behaviour. |
 | `4` | Last 4 user/assistant messages — good balance for multi-turn voice |
 | `0` | Skip classification entirely; forward to the classifier tier directly |
 
