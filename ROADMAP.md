@@ -554,7 +554,7 @@ Each layer is a tiny classification call (1.7b, no-think, <1s). The final routin
 
 ---
 
-
+### Classifier auto-tuning routine
 
 An automated calibration procedure that tunes classifier prompts and tier boundaries to the
 operator's specific model inventory. When an operator installs lm-gateway-rs and configures
