@@ -265,6 +265,15 @@ classifier         = "local:instant"
 classifier_context = 4  # only last 4 user/assistant messages
 ```
 
+Special values:
+
+| Value | Behaviour |
+|---|---|
+| Absent (default) | Full user+assistant history |
+| `1` | Only the most recent user or assistant message (approximates pre-`classifier_context` behaviour) |
+| `4` | Last 4 user/assistant messages — good balance for multi-turn voice |
+| `0` | Skip classification entirely; forward to the classifier tier directly |
+
 When omitted (the default), all user and assistant messages are included. For single-message requests, the message is sent to the classifier as-is with no formatting overhead.
 
 For multi-message conversations, the classifier input is formatted as:

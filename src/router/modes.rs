@@ -79,36 +79,55 @@ pub(super) fn classify_and_resolve<'a>(
         let message_count = messages.map_or(0, |arr| arr.len());
 
         let classifier_input = messages.and_then(|arr| {
-            // Filter to user + assistant messages with text content.
-            let relevant: Vec<(&str, &str)> = arr
-                .iter()
-                .filter_map(|m| {
-                    let role = m.get("role").and_then(Value::as_str)?;
-                    if role != "user" && role != "assistant" {
-                        return None;
-                    }
-                    let content = m.get("content").and_then(Value::as_str)?;
-                    Some((role, content))
-                })
-                .collect();
+            // `Some(0)` means "skip classification entirely".
+            if profile.classifier_context == Some(0) {
+                return None;
+            }
 
-            if relevant.is_empty() {
+            // Build the window: filter user/assistant text messages, optionally
+            // capped to the last N. Walk from the end when bounded to avoid
+            // scanning the full history for small contexts (e.g. 1–4 messages).
+            let window: Vec<(&str, &str)> = match profile.classifier_context {
+                Some(n) => {
+                    let n = n as usize;
+                    let mut w: Vec<(&str, &str)> = arr
+                        .iter()
+                        .rev()
+                        .filter_map(|m| {
+                            let role = m.get("role").and_then(Value::as_str)?;
+                            if role != "user" && role != "assistant" {
+                                return None;
+                            }
+                            let content = m.get("content").and_then(Value::as_str)?;
+                            Some((role, content))
+                        })
+                        .take(n)
+                        .collect();
+                    w.reverse();
+                    w
+                }
+                None => arr
+                    .iter()
+                    .filter_map(|m| {
+                        let role = m.get("role").and_then(Value::as_str)?;
+                        if role != "user" && role != "assistant" {
+                            return None;
+                        }
+                        let content = m.get("content").and_then(Value::as_str)?;
+                        Some((role, content))
+                    })
+                    .collect(),
+            };
+
+            if window.is_empty() {
                 return None;
             }
 
             // Require at least one user message — assistant-only context isn't
             // meaningful for classification.
-            if !relevant.iter().any(|(role, _)| *role == "user") {
+            if !window.iter().any(|(role, _)| *role == "user") {
                 return None;
             }
-
-            // Apply classifier_context limit (take last N messages).
-            // `Some(0)` means "no context" — skip classification entirely.
-            let window: &[(&str, &str)] = match profile.classifier_context {
-                Some(0) => return None,
-                Some(n) if n < relevant.len() => &relevant[relevant.len() - n..],
-                _ => &relevant,
-            };
 
             // Single message (common case): return it as-is.
             if window.len() == 1 {
@@ -118,7 +137,7 @@ pub(super) fn classify_and_resolve<'a>(
             // Multi-message: format as a labelled conversation block.
             // Use window.len() so the count reflects filtered messages actually sent.
             let mut buf = format!("[{} messages in conversation]\n", window.len());
-            for (role, content) in window {
+            for (role, content) in &window {
                 let label = if *role == "user" { "User" } else { "Assistant" };
                 buf.push_str(label);
                 buf.push_str(": ");
@@ -129,7 +148,7 @@ pub(super) fn classify_and_resolve<'a>(
         });
 
         let Some(classifier_input) = classifier_input else {
-            debug!(profile = %profile_name, "no user message — bypassing classification");
+            debug!(profile = %profile_name, "classifier input unavailable — bypassing classification");
             return Ok(RoutingResolution {
                 tier_name: classifier_tier.name.clone(),
                 think_override: None,

@@ -178,7 +178,7 @@ pub struct ProfileConfig {
     /// context awareness (e.g. Home Assistant voice, where each utterance is
     /// mostly self-contained).
     #[serde(default)]
-    pub classifier_context: Option<usize>,
+    pub classifier_context: Option<u32>,
 
     /// Static response text returned by `reply` mode without calling any backend.
     ///
