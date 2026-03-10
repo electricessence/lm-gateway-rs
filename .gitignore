@@ -9,6 +9,9 @@ tools/.env.ps1
 # Temp scripts and test results (session-specific, not committed)
 tools/temp/
 
+# Live operational config — machine-specific, not committed
+etc/lm-gateway/config.toml
+
 # One-off test artifacts
 ct.json
 ct_full.json
